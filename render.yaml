@@ -1,0 +1,19 @@
+services:
+  - type: worker
+    name: cmimradar-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_worker.py
+    plan: free
+    region: frankfurt
+    envVars:
+      - key: TG_BOT_TOKEN
+        sync: false
+      - key: VAPID_PRIVATE
+        sync: false
+      - key: BOT_KEY
+        sync: false
+      - key: TG_ADMIN_CHAT
+        sync: false
+      - key: SITE_URL
+        value: https://cmimradar.netlify.app

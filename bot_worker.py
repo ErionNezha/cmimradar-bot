@@ -145,6 +145,21 @@ def load_state():
     raise SystemExit("bot-state i paarritshëm pas 12 provash.")
 
 
+def load_state_once():
+    """Një tentativë e vetme pa retry/exit — për webhook (pa memorie të vjetruar)."""
+    global STATE
+    try:
+        s = bs_load()
+    except Exception:
+        s = None
+    if isinstance(s, dict):
+        base = default_state()
+        base.update(s)
+        STATE = base
+        return True
+    return False
+
+
 def save_state(force=False):
     global STATE_DIRTY
     if STATE_DIRTY or force:
@@ -874,9 +889,11 @@ def run_webhook():
                 length = int(self.headers.get("Content-Length", 0))
                 u = json.loads(self.rfile.read(length) or b"{}")
                 if u:
+                    # state i freskët nga Blobs për ÇDO kërkesë — s'ka memorie
+                    # të vjetruar që të mbishkruajë ndryshimet e cron-it të VM-së
+                    load_state_once()
                     handle_update(u)
-                    mark_dirty()
-                    save_state()
+                    save_state(force=True)
             except Exception:
                 print("  !! gabim në webhook:\n%s" % traceback.format_exc()[:400], flush=True)
             self.send_response(200)

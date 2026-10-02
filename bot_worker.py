@@ -896,13 +896,8 @@ def run_webhook():
     port = int(os.environ.get("PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("Webhook server në portin %d." % port, flush=True)
-
-    def jobs_loop():
-        while True:
-            time.sleep(60)
-            run_jobs()
-    import threading
-    threading.Thread(target=jobs_loop, daemon=True).start()
+    # Në webhook mode NUK ka jobs loop: shërbimi fle kur s'ka mesazhe,
+    # kontrollet periodike (alarme, digest, përmbledhje admin) i bën cron-i i VM-së.
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -915,11 +910,12 @@ def main():
     refresh_data(force=True)
     me = tg("getMe", {})
     print("Bot: %s" % ((me.get("result") or {}).get("username") if me else "?"), flush=True)
-    if ADMIN_CHAT:
-        tg_send(ADMIN_CHAT, "🤖 <b>ÇmimRadar Bot u ndez në Render.</b>\nPërgjigjet në sekonda. ✅")
     if os.environ.get("PORT"):
+        # webhook mode: pa mesazh "u ndez" (cold start-et janë të shpeshta)
         run_webhook()
     else:
+        if ADMIN_CHAT:
+            tg_send(ADMIN_CHAT, "🤖 <b>ÇmimRadar Bot u ndez.</b>\nPërgjigjet në sekonda. ✅")
         run_polling()
 
 

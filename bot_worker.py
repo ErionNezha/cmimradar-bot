@@ -826,16 +826,8 @@ def run_jobs():
         print("  !! gabim në jobs:\n%s" % traceback.format_exc()[:600], flush=True)
 
 # ---------------------------------------------------------------- main loop
-def main():
-    print("ÇmimRadar Bot worker u nis.", flush=True)
-    load_state()
-    refresh_data(force=True)
-    me = tg("getMe", {})
-    print("Bot: %s" % ((me.get("result") or {}).get("username") if me else "?"), flush=True)
-    # përshëndetje adminit në start (një herë)
-    if ADMIN_CHAT:
-        tg_send(ADMIN_CHAT, "🤖 <b>ÇmimRadar Bot u ndez në Render.</b>\nPërgjigjet në sekonda. ✅",
-                markup=None)
+def run_polling():
+    """Long polling — për testim lokal."""
     while True:
         try:
             params = {"timeout": 30}
@@ -851,6 +843,84 @@ def main():
             print("  !! gabim në poll:\n%s" % traceback.format_exc()[:600], flush=True)
             time.sleep(5)
         run_jobs()
+
+
+def run_webhook():
+    """Webhook mode — për Render Web Service (falas). Vetëm stdlib."""
+    import hashlib
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    secret = hashlib.sha256(TG_BOT_TOKEN.encode()).hexdigest()[:32]
+    secret_path = "/webhook/" + secret
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/" or self.path == "/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            if self.path != secret_path:
+                self.send_response(403)
+                self.end_headers()
+                return
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                u = json.loads(self.rfile.read(length) or b"{}")
+                if u:
+                    handle_update(u)
+                    mark_dirty()
+                    save_state()
+            except Exception:
+                print("  !! gabim në webhook:\n%s" % traceback.format_exc()[:400], flush=True)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+    # regjistro webhook-un te Telegram (URL nga Render)
+    base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if base:
+        wh_url = base + secret_path
+        r = tg("setWebhook", {"url": wh_url, "max_connections": 40,
+                              "allowed_updates": ["message", "callback_query"]})
+        print("setWebhook: %s -> %s" % (wh_url, bool(r and r.get("ok"))), flush=True)
+    else:
+        print("RENDER_EXTERNAL_URL mungon — webhook s'u regjistrua.", flush=True)
+
+    port = int(os.environ.get("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print("Webhook server në portin %d." % port, flush=True)
+
+    def jobs_loop():
+        while True:
+            time.sleep(60)
+            run_jobs()
+    import threading
+    threading.Thread(target=jobs_loop, daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main():
+    print("ÇmimRadar Bot worker u nis.", flush=True)
+    load_state()
+    refresh_data(force=True)
+    me = tg("getMe", {})
+    print("Bot: %s" % ((me.get("result") or {}).get("username") if me else "?"), flush=True)
+    if ADMIN_CHAT:
+        tg_send(ADMIN_CHAT, "🤖 <b>ÇmimRadar Bot u ndez në Render.</b>\nPërgjigjet në sekonda. ✅")
+    if os.environ.get("PORT"):
+        run_webhook()
+    else:
+        run_polling()
 
 
 if __name__ == "__main__":

@@ -1,2 +1,2 @@
-pywebpush==1.17.0
+pywebpush==2.5.0
 cryptography==44.0.0

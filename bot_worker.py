@@ -21,8 +21,10 @@ Env vars (Render dashboard):
   TG_BOT_TOKEN, VAPID_PRIVATE, BOT_KEY, TG_ADMIN_CHAT, SITE_URL
 """
 import base64
+import html as htmlmod
 import json
 import os
+import random
 import re
 import time
 import traceback
@@ -319,7 +321,7 @@ def handle_search(chat_id, query):
     if not res:
         tg_send(chat_id,
                 "🔍 S'gjeta <b>%s</b> në radar.\n\nProvo me më pak fjalë (p.sh. <i>iphone 17</i>) "
-                "ose shiko faqen: %s" % (query[:60], SITE_URL))
+                "ose shiko faqen: %s" % (htmlmod.escape(query[:60]), SITE_URL))
         return
     g = res[0]
     tg_send(chat_id, format_product(g, g["key"]), preview=True)
@@ -359,10 +361,12 @@ def cmd_digest(chat_id):
     if str(chat_id) in [str(x) for x in subs]:
         STATE["digest_subs"] = [x for x in subs if str(x) != str(chat_id)]
         mark_dirty()
+        record_op({"digest_toggle": {"chat_id": str(chat_id), "on": False}})
         tg_send(chat_id, "📰 <b>Digest-i u çaktivizua.</b>\nNuk do të marrësh më top-5 uljet e ditës.")
     else:
         subs.append(chat_id)
         mark_dirty()
+        record_op({"digest_toggle": {"chat_id": str(chat_id), "on": True}})
         tg_send(chat_id,
                 "📰 <b>U abonove në digest-in ditor!</b>\n\nÇdo mbrëmje të vijnë "
                 "<b>top-5 uljet e ditës</b> automatikisht. Për ta ndalur: /digest sërish.")
@@ -392,13 +396,15 @@ def handle_callback(cb):
         return
     if data.startswith("del:"):
         _, key, target = (data.split(":") + ["", ""])[:3]
-        before = len(STATE.get("subs", []))
-        STATE["subs"] = [s for s in STATE.get("subs", [])
-                         if not (s.get("channel") == "telegram"
-                                 and str(s.get("chat_id")) == str(chat_id)
-                                 and s.get("key") == key and str(s.get("target")) == target)]
-        removed = before - len(STATE.get("subs", []))
+        before = STATE.get("subs", [])
+        removed = [s for s in before
+                   if s.get("channel") == "telegram"
+                   and str(s.get("chat_id")) == str(chat_id)
+                   and s.get("key") == key and str(s.get("target")) == target]
+        STATE["subs"] = [s for s in before if s not in removed]
         mark_dirty()
+        if removed:
+            record_op({"sub_del": removed})
         tg_answer_callback(cb_id, "✅ Alarmi u fshi." if removed else "S'u gjet.")
         if removed:
             tg_send(chat_id, "🗑️ <b>Alarmi u fshi.</b>\nMund të vendosësh të ri nga faqja kur të duash. 🔔")
@@ -430,22 +436,31 @@ def handle_deeplink(chat_id, payload):
         tg_send(chat_id, "❌ Produkti nuk u gjet në radar. Provo sërish nga faqja.")
         return
     if kind == "tg":
-        STATE.setdefault("subs", []).append(
-            {"channel": "telegram", "chat_id": chat_id, "key": key,
-             "target": target, "name": g["title"][:80]})
-        mark_dirty()
+        subs = STATE.setdefault("subs", [])
+        new_sub = {"channel": "telegram", "chat_id": chat_id, "key": key,
+                   "target": target, "name": g["title"][:80]}
+        exists = any(s.get("channel") == "telegram"
+                     and str(s.get("chat_id")) == str(chat_id)
+                     and s.get("key") == key and s.get("target") == target
+                     for s in subs)
+        if not exists:
+            subs.append(new_sub)
+            mark_dirty()
+            record_op({"sub_add": new_sub})
         tg_send(chat_id,
                 "✅ <b>Alarmi u aktivizua!</b>\n\n<b>%s</b>\n"
-                "Do të njoftohesh këtu kur çmimi të bjerë në <b>%s L</b> ose më pak.\n\n"
-                "Çmimi tani: %s L te %s." %
-                (g["title"][:80], fmt_price(target),
-                 fmt_price((g.get("best") or {}).get("price")),
-                 (g.get("best") or {}).get("store_name", "")),
+                "Do të njoftohesh këtu kur çmimi të bjerë në <b>%s L</b> ose më pak.\n\n" % (
+                    g["title"][:80], fmt_price(target)) +
+                ("Ky alarm ekzistonte tashmë — nuk u dyfishua." if exists else
+                 "Çmimi tani: %s L te %s." % (
+                     fmt_price((g.get("best") or {}).get("price")),
+                     (g.get("best") or {}).get("store_name", ""))),
                 markup=MAIN_KB)
     else:
-        STATE.setdefault("pending", {})[str(chat_id)] = {
-            "key": key, "target": target, "name": g["title"][:80]}
+        pend = {"key": key, "target": target, "name": g["title"][:80]}
+        STATE.setdefault("pending", {})[str(chat_id)] = pend
         mark_dirty()
+        record_op({"pending_put": {"chat_id": str(chat_id), "data": pend}})
         tg_send(chat_id,
                 "📧 <b>%s</b>\n\nShkruaj <b>email-in tënd</b> si mesazh këtu që ta "
                 "konfirmojmë alarmin (synimi: %s L)." % (g["title"][:80], fmt_price(target)))
@@ -468,7 +483,7 @@ def handle_community_photo(chat_id, m):
     fid = photos[-1]["file_id"]
     fpath = tg_get_file(fid)
     data = tg_download_file(fpath) if fpath else None
-    pid = "c%d" % int(time.time())
+    pid = "c%d_%04d" % (int(time.time()), random.randint(0, 9999))
     ok = bool(bs_photo_put({
         "id": pid, "chat_id": chat_id, "product": product, "store": store,
         "price": price, "caption": cap, "date": time.strftime("%Y-%m-%d %H:%M"),
@@ -499,6 +514,7 @@ def handle_message(m):
     if str(chat_id) in [str(x) for x in STATE.get("awaiting_search", [])]:
         STATE["awaiting_search"] = [x for x in STATE["awaiting_search"] if str(x) != str(chat_id)]
         mark_dirty()
+        record_op({"awaiting_del": str(chat_id)})
         handle_search(chat_id, txt)
         return
 
@@ -507,6 +523,7 @@ def handle_message(m):
         if str(chat_id) not in [str(x) for x in STATE.get("awaiting_search", [])]:
             STATE.setdefault("awaiting_search", []).append(chat_id)
             mark_dirty()
+            record_op({"awaiting_add": str(chat_id)})
         tg_send(chat_id, "🔍 <b>Çfarë po kërkon?</b>\nShkruaj emrin e produktit, p.sh. <i>iphone 17</i>.")
         return
     if txt == "🔥 Oferta e ditës":
@@ -555,11 +572,13 @@ def handle_message(m):
     if str(chat_id) in STATE.get("pending", {}):
         p = STATE["pending"][str(chat_id)]
         if EMAIL_RE.match(txt):
-            STATE.setdefault("subs", []).append(
-                {"channel": "email", "email": txt, "key": p["key"],
-                 "target": p["target"], "name": p["name"]})
+            new_sub = {"channel": "email", "email": txt, "key": p["key"],
+                       "target": p["target"], "name": p["name"]}
+            STATE.setdefault("subs", []).append(new_sub)
             del STATE["pending"][str(chat_id)]
             mark_dirty()
+            record_op({"sub_add": new_sub})
+            record_op({"pending_del": [str(chat_id)]})
             tg_send(chat_id,
                     "✅ <b>Alarmi me email u aktivizua!</b>\n\nNjoftimet do të vijnë te "
                     "<b>%s</b> kur çmimi të bjerë në %s L ose më pak." % (txt, fmt_price(p["target"])),
@@ -849,6 +868,7 @@ def run_polling():
     """Long polling — për testim lokal."""
     while True:
         try:
+            PENDING_OPS.clear()  # në polling ruhet full-state, jo ops-e
             params = {"timeout": 30}
             if STATE.get("offset"):
                 params["offset"] = STATE["offset"]
@@ -864,12 +884,34 @@ def run_polling():
         run_jobs()
 
 
+# ---------------------------------------------------------------- ops (intent-tracking)
+# Çdo ndryshim i state-it regjistrohet si operacion atomik; në webhook mode
+# dërgohen VETËM ops-et (kurrë mbishkrim i plotë) → pa gara me Blobs.
+PENDING_OPS = []
+
+
+def record_op(op):
+    PENDING_OPS.append(op)
+
+
+def flush_ops():
+    ok = True
+    for op in PENDING_OPS:
+        if bs_request("POST", op) is None:
+            ok = False
+    PENDING_OPS.clear()
+    return ok
+
+
 def run_webhook():
     """Webhook mode — për Render Web Service (falas). Vetëm stdlib."""
     import hashlib
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     secret = hashlib.sha256(TG_BOT_TOKEN.encode()).hexdigest()[:32]
     secret_path = "/webhook/" + secret
+    # secret_token i Telegram-it (mbrojtje shtesë: verifikohet header-i)
+    secret_token = hashlib.sha256((TG_BOT_TOKEN + ":wh-secret").encode()).hexdigest()[:32]
+    MAX_BODY = 1024 * 1024  # 1 MB — update-et e Telegram janë disa KB
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -889,15 +931,26 @@ def run_webhook():
                 self.send_response(403)
                 self.end_headers()
                 return
+            if self.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret_token:
+                self.send_response(403)
+                self.end_headers()
+                return
             try:
                 length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = 0
+            if length > MAX_BODY:
+                self.send_response(413)
+                self.end_headers()
+                return
+            try:
                 u = json.loads(self.rfile.read(length) or b"{}")
                 if u:
-                    # state i freskët nga Blobs për ÇDO kërkesë — s'ka memorie
-                    # të vjetruar që të mbishkruajë ndryshimet e cron-it të VM-së
+                    # ops-et dërgohen atomike; s'ka mbishkrim të plotë → pa gara
+                    PENDING_OPS.clear()
                     load_state_once()
                     handle_update(u)
-                    save_state(force=True)
+                    flush_ops()
             except Exception:
                 print("  !! gabim në webhook:\n%s" % traceback.format_exc()[:400], flush=True)
             self.send_response(200)
@@ -909,6 +962,7 @@ def run_webhook():
     if base:
         wh_url = base + secret_path
         r = tg("setWebhook", {"url": wh_url, "max_connections": 40,
+                              "secret_token": secret_token,
                               "allowed_updates": ["message", "callback_query"]})
         print("setWebhook: %s -> %s" % (wh_url, bool(r and r.get("ok"))), flush=True)
     else:

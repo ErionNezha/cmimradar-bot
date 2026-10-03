@@ -98,7 +98,11 @@ def bs_request(method, body=None):
     req = urllib.request.Request(STATE_URL, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return json.load(r)
+            body = r.read()
+        try:
+            return json.loads(body)
+        except Exception:
+            return body.decode("utf-8", "replace")  # p.sh. "state-ok" (tekst)
     except Exception as e:
         print("  !! bot-state %s: %s" % (method, str(e)[:120]), flush=True)
         return None

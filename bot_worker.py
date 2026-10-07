@@ -228,6 +228,7 @@ BOT_HELP = (
     "🔔 <b>Alarme:</b> nga faqja hap produktin → 🔔 <b>Alarm uljeje</b> → tabin <b>Telegram</b> → "
     "<b>Vazhdo</b> → <b>START</b> këtu. Fshihen me /alerts.\n"
     "🔥 <b>/oferta</b> — oferta e ditës.\n"
+    "🏆 <b>/top</b> — top 10 uljet e ditës.\n"
     "📰 <b>/digest</b> — abonohu në top-5 uljet e ditës (çdo mbrëmje).\n"
     "📸 <b>Ofertë nga komuniteti:</b> dërgo foto me <code>Produkti | Dyqani | Çmimi</code> në përshkrim.\n\n"
     "🌐 " + SITE_URL
@@ -377,6 +378,29 @@ def cmd_digest(chat_id):
         tg_send(chat_id,
                 "📰 <b>U abonove në digest-in ditor!</b>\n\nÇdo mbrëmje të vijnë "
                 "<b>top-5 uljet e ditës</b> automatikisht. Për ta ndalur: /digest sërish.")
+
+
+def cmd_top(chat_id):
+    if not refresh_data():
+        tg_send(chat_id, "⚠️ S'munda të lexoj të dhënat. Provo pas pak.")
+        return
+    rep = DATA["report"] or {}
+    drops = rep.get("drops") or []
+    if not drops:
+        tg_send(chat_id, "📊 S'ka ulje sot. Kthehu nesër!")
+        return
+    lines = ["🏆 <b>TOP 10 ULJET E DITËS</b>\n"]
+    for i, d in enumerate(drops[:10], 1):
+        title = (d.get("title") or "")[:55]
+        price = d.get("price")
+        old = d.get("old_price")
+        store = d.get("store_name", "")
+        pct = ""
+        if old and price and old > price:
+            pct = " (−%s%%)" % round((old - price) / old * 100, 1)
+        lines.append("%d. <b>%s</b>\n   💰 %s L%s te %s" % (
+            i, title, fmt_price(price), pct, store))
+    tg_send(chat_id, "\n".join(lines))
 
 
 def send_alerts_list(chat_id):
@@ -561,6 +585,9 @@ def handle_message(m):
         return
     if low == "/digest":
         cmd_digest(chat_id)
+        return
+    if low in ("/top", "/top10", "top"):
+        cmd_top(chat_id)
         return
     if low.startswith("/stop"):
         tg_send(chat_id, "🛑 Për të ndaluar njoftimet, fshi alarmet me /alerts. "

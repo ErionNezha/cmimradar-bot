@@ -380,6 +380,24 @@ def cmd_digest(chat_id):
                 "<b>top-5 uljet e ditës</b> automatikisht. Për ta ndalur: /digest sërish.")
 
 
+def cmd_newsletter(chat_id):
+    """Abonim/ç'abonim në newsletter-in email javor."""
+    if str(chat_id) in STATE.get("pending_newsletter", {}):
+        tg_send(chat_id, "📧 Shkruaj email-in tënd për newsletter-in javor.")
+        return
+    subs = STATE.setdefault("email_digest_subs", [])
+    # kontrollo nëse ky chat ka tashmë email të abonuar
+    existing = [s for s in subs if isinstance(s, dict) and str(s.get("chat_id")) == str(chat_id)]
+    if existing:
+        STATE["email_digest_subs"] = [s for s in subs if not (isinstance(s, dict) and str(s.get("chat_id")) == str(chat_id))]
+        mark_dirty()
+        tg_send(chat_id, "📧 <b>U ç'abonove nga newsletter-i.</b>\nNuk do të marrësh më RADARIN JAVOR me email.")
+        return
+    STATE.setdefault("pending_newsletter", {})[str(chat_id)] = True
+    mark_dirty()
+    tg_send(chat_id, "📧 <b>Newsletter javor</b>\n\nShkruaj email-in tënd dhe çdo të hënë do të marrësh <b>RADARIN JAVOR</b> me top uljet e javës.")
+
+
 def cmd_top(chat_id):
     if not refresh_data():
         tg_send(chat_id, "⚠️ S'munda të lexoj të dhënat. Provo pas pak.")
@@ -589,6 +607,9 @@ def handle_message(m):
     if low in ("/top", "/top10", "top"):
         cmd_top(chat_id)
         return
+    if low in ("/newsletter", "/email"):
+        cmd_newsletter(chat_id)
+        return
     if low.startswith("/stop"):
         tg_send(chat_id, "🛑 Për të ndaluar njoftimet, fshi alarmet me /alerts. "
                          "Bllokimi i botit i ndalon të gjitha.")
@@ -600,6 +621,21 @@ def handle_message(m):
             handle_deeplink(chat_id, payload)
         else:
             tg_send(chat_id, BOT_WELCOME, markup=MAIN_KB)
+        return
+
+    # email në pritje (newsletter javor)
+    if str(chat_id) in STATE.get("pending_newsletter", {}):
+        if EMAIL_RE.match(txt):
+            STATE.setdefault("email_digest_subs", []).append(
+                {"email": txt, "chat_id": str(chat_id)})
+            del STATE["pending_newsletter"][str(chat_id)]
+            mark_dirty()
+            tg_send(chat_id,
+                    "✅ <b>U abonove në newsletter!</b>\n\nÇdo të hënë do të marrësh "
+                    "<b>RADARIN JAVOR</b> te <b>%s</b>.\nPër ta ndalur: /newsletter sërish." % txt,
+                    markup=MAIN_KB)
+        else:
+            tg_send(chat_id, "❌ Ky s'duket email i vlefshëm. Shkruaje sërish, p.sh. emri@shembull.com")
         return
 
     # email në pritje (konfirmim alarmi)

@@ -307,6 +307,13 @@ def format_product(g, key):
             if mx and mx > price:
                 lines.append("📊 %d dyqane · diferenca %s%%" %
                              (len(offers), round((mx - price) / mx * 100, 1)))
+        sig = g.get("buy_signal")
+        if sig == "rekord":
+            lines.append("🔥 <b>BLEJ TANI</b> — çmimi më i ulët ndonjëherë!")
+        elif sig == "mire":
+            lines.append("✅ <b>Çmim i mirë</b> — ndër më të ulëtit historik.")
+        elif sig == "shtrenjte":
+            lines.append("⏳ <b>Prit</b> — çmimi është i lartë tani.")
     else:
         lines.append("⏳ Pa çmime ende në radar.")
     lines.append('🔗 <a href="%s">Shiko në faqe</a>' % product_link(key))

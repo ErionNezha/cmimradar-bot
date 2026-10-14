@@ -31,6 +31,27 @@ import traceback
 import urllib.parse
 import urllib.request
 
+
+def _load_dotenv():
+    """Botkeep i ruan variablat në file-in .env (rrënja e projektit), jo në env të procesit.
+
+    Ngarkohen me setdefault: env-i real (p.sh. Render) ka gjithmonë përparësi.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+    except OSError:
+        pass
+
+
+_load_dotenv()
+
 # ---------------------------------------------------------------- config
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 VAPID_PRIVATE = os.environ.get("VAPID_PRIVATE", "").strip()
@@ -1028,7 +1049,8 @@ def run_webhook():
             self.wfile.write(b"ok")
 
     # regjistro webhook-un te Telegram (URL nga Render)
-    base = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    base = (os.environ.get("PUBLIC_BASE_URL")
+            or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
     if base:
         wh_url = base + secret_path
         r = tg("setWebhook", {"url": wh_url, "max_connections": 40,
@@ -1038,7 +1060,7 @@ def run_webhook():
     else:
         print("RENDER_EXTERNAL_URL mungon — webhook s'u regjistrua.", flush=True)
 
-    port = int(os.environ.get("PORT", "10000"))
+    port = int(os.environ.get("PORT") or os.environ.get("SERVER_PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("Webhook server në portin %d." % port, flush=True)
     # Në webhook mode NUK ka jobs loop: shërbimi fle kur s'ka mesazhe,
@@ -1055,7 +1077,7 @@ def main():
     refresh_data(force=True)
     me = tg("getMe", {})
     print("Bot: %s" % ((me.get("result") or {}).get("username") if me else "?"), flush=True)
-    if os.environ.get("PORT"):
+    if os.environ.get("PORT") or os.environ.get("SERVER_PORT"):
         # webhook mode: pa mesazh "u ndez" (cold start-et janë të shpeshta)
         run_webhook()
     else:

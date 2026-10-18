@@ -31,7 +31,6 @@ import traceback
 import urllib.parse
 import urllib.request
 
-
 def _load_dotenv():
     """Botkeep i ruan variablat në file-in .env (rrënja e projektit), jo në env të procesit.
 
@@ -145,6 +144,16 @@ def bs_save(state):
 def bs_photo_put(photo):
     return bs_request("POST", {"photo": photo})
 
+
+def write_heartbeat():
+    """Heartbeat në bot-state (POST {heartbeat: ts}, auth x-bot-key: BOT_KEY).
+    RREGULLUAR 2026-10-15 (Super Robot faza 2, rrënja B): më parë kjo thirrej
+    VETËM nga run_jobs() brenda run_polling() — në webhook mode (shërbimi i
+    vendosur: Render/Botkeep web service me PORT) run_jobs() s'ekzekutohet
+    KURRË, ndaj heartbeat-i s'shkruhej kurrë dhe vlera në Blobs mbetej
+    placeholder-i 1234567890 (2009). Tani e thërret edhe webhook mode."""
+    return bs_request("POST", {"heartbeat": int(time.time())})
+
 # ---------------------------------------------------------------- state (memory + flush)
 STATE = {}
 STATE_DIRTY = False
@@ -152,8 +161,9 @@ STATE_DIRTY = False
 
 def default_state():
     return {"offset": 0, "subs": [], "pending": {}, "digest_subs": [],
-            "awaiting_search": [], "last_push_date": "", "last_digest_date": "",
-            "last_report_date": "", "store_fails": {}}
+            "awaiting_search": [], "email_digest_subs": [],
+            "pending_newsletter": {}, "last_push_date": "",
+            "last_digest_date": "", "last_report_date": "", "store_fails": {}}
 
 
 def load_state():
@@ -218,7 +228,12 @@ def refresh_data(force=False):
         rep = fetch_json(SITE_URL + "/data/report.json")
         DATA["products"] = prods
         DATA["report"] = rep
-        DATA["bykey"] = {g["key"]: g for g in prods.get("groups", [])}
+        bykey = {g["key"]: g for g in prods.get("groups", [])}
+        # aliaset: çelësat e vjetër → grupi aktual (alarmet e vjetra s'humbasin)
+        for old, new in (prods.get("aliases") or {}).items():
+            if old not in bykey and new in bykey:
+                bykey[old] = bykey[new]
+        DATA["bykey"] = bykey
         DATA["ts"] = time.time()
         print("Të dhënat u rifreskuan (%d grupe)." % len(DATA["bykey"]), flush=True)
         return True
@@ -239,9 +254,28 @@ BOT_WELCOME = (
     "🔔 Vendos <b>alarme uljeje</b> nga faqja — të njoftoj këtu sapo çmimi të bjerë.\n"
     "📸 Dërgomë <b>foto-ofertë</b> me <code>Produkti | Dyqani | Çmimi</code> — e publikojmë pas verifikimit.\n\n"
     "Përdor butonat më poshtë ose komandat:\n"
-    "🔥 /oferta · 📰 /digest · 📋 /alerts · ❓ /help\n\n"
+    "🔥 /oferta · 🏆 /top · 📰 /digest · 📧 /newsletter · 📋 /alerts · ❓ /help\n\n"
     "🌐 " + SITE_URL
 )
+
+
+BOT_COMMANDS = [
+    {"command": "oferta", "description": "🔥 Oferta e ditës"},
+    {"command": "top", "description": "🏆 Top 10 uljet e ditës"},
+    {"command": "digest", "description": "📰 Digest-i ditor (abono/çabono)"},
+    {"command": "newsletter", "description": "📧 Newsletter javor me email"},
+    {"command": "alerts", "description": "📋 Alarmet e mia"},
+    {"command": "help", "description": "❓ Ndihma"},
+]
+
+
+def register_commands():
+    """Regjistron menunë e komandave te Telegrami (butoni '/' i chat-it).
+    U shtua 2026-10-17: më parë komandat s'ishin regjistruar kurrë —
+    përdoruesi s'i shihte te menuja, vetëm te tekstet."""
+    r = tg("setMyCommands", {"commands": json.dumps(BOT_COMMANDS, ensure_ascii=False)})
+    print("setMyCommands: %s" % bool(r and r.get("ok")), flush=True)
+
 
 BOT_HELP = (
     "❓ <b>Ndihma — ÇmimRadar Bot</b>\n\n"
@@ -251,6 +285,7 @@ BOT_HELP = (
     "🔥 <b>/oferta</b> — oferta e ditës.\n"
     "🏆 <b>/top</b> — top 10 uljet e ditës.\n"
     "📰 <b>/digest</b> — abonohu në top-5 uljet e ditës (çdo mbrëmje).\n"
+    "📧 <b>/newsletter</b> — RADARI JAVOR me email (çdo të hënë).\n"
     "📸 <b>Ofertë nga komuniteti:</b> dërgo foto me <code>Produkti | Dyqani | Çmimi</code> në përshkrim.\n\n"
     "🌐 " + SITE_URL
 )
@@ -281,7 +316,7 @@ def fmt_price(p):
 
 
 def product_link(key):
-    return SITE_URL + "/product.html?key=" + key
+    return SITE_URL + "/?p=" + urllib.parse.quote(str(key))
 
 
 def user_subs(chat_id):
@@ -311,6 +346,9 @@ def search_products(query, limit=5):
         best = g.get("best") or {}
         if best.get("price"):
             score += 2
+        score += min(int(g.get("n_stores") or 1), 10) * 0.3   # krahasim mes më shumë dyqanesh
+        if g.get("condition") == "used":
+            score -= 1
         scored.append((score, g))
     scored.sort(key=lambda x: -x[0])
     return [g for _, g in scored[:limit]]
@@ -356,7 +394,7 @@ def handle_search(chat_id, query):
     tg_send(chat_id, format_product(g, g["key"]), preview=True)
     if len(res) > 1:
         btns = [[{"text": ("✅ " if i == 0 else "") + r["title"][:40],
-                  "callback_data": "prod:%s" % r["key"]}] for i, r in enumerate(res[1:4])]
+                  "callback_data": "prod:%s" % r["key"]}] for i, r in enumerate(res[1:5])]
         tg_send(chat_id, "🔎 <b>Rezultate të tjera:</b>", markup={"inline_keyboard": btns})
 
 # ---------------------------------------------------------------- komandat
@@ -412,10 +450,12 @@ def cmd_newsletter(chat_id):
     if existing:
         STATE["email_digest_subs"] = [s for s in subs if not (isinstance(s, dict) and str(s.get("chat_id")) == str(chat_id))]
         mark_dirty()
+        record_op({"newsletter_del": {"chat_id": str(chat_id)}})
         tg_send(chat_id, "📧 <b>U ç'abonove nga newsletter-i.</b>\nNuk do të marrësh më RADARIN JAVOR me email.")
         return
     STATE.setdefault("pending_newsletter", {})[str(chat_id)] = True
     mark_dirty()
+    record_op({"pending_newsletter_put": str(chat_id)})
     tg_send(chat_id, "📧 <b>Newsletter javor</b>\n\nShkruaj email-in tënd dhe çdo të hënë do të marrësh <b>RADARIN JAVOR</b> me top uljet e javës.")
 
 
@@ -647,10 +687,12 @@ def handle_message(m):
     # email në pritje (newsletter javor)
     if str(chat_id) in STATE.get("pending_newsletter", {}):
         if EMAIL_RE.match(txt):
-            STATE.setdefault("email_digest_subs", []).append(
-                {"email": txt, "chat_id": str(chat_id)})
+            rec = {"email": txt, "chat_id": str(chat_id)}
+            STATE.setdefault("email_digest_subs", []).append(rec)
             del STATE["pending_newsletter"][str(chat_id)]
             mark_dirty()
+            record_op({"newsletter_put": rec})
+            record_op({"pending_newsletter_del": str(chat_id)})
             tg_send(chat_id,
                     "✅ <b>U abonove në newsletter!</b>\n\nÇdo të hënë do të marrësh "
                     "<b>RADARIN JAVOR</b> te <b>%s</b>.\nPër ta ndalur: /newsletter sërish." % txt,
@@ -834,14 +876,18 @@ def send_push_digest():
         return 0
     try:
         pct = float(gaps[0].get("gap_pct") or 0)
+        save = float(gaps[0].get("save_pct") or 0)
     except Exception:
         return 0
     if pct < PUSH_GAP_THRESHOLD:
         return 0
+    g0 = gaps[0]
     payload = json.dumps({
-        "title": "🔥 ÇmimRadar: %.1f%% diferencë!" % pct,
-        "body": "%s — krahaso çmimet para se të blesh." % (gaps[0].get("name") or "")[:60],
-        "url": SITE_URL + "/#raporti",
+        "title": ("🔥 Kurse %.0f%% te i njëjti produkt!" % save) if save else ("🔥 ÇmimRadar: %.1f%% diferencë!" % pct),
+        "body": "%s — %s L te %s." % ((g0.get("name") or "")[:50], fmt_price(g0.get("min_price")),
+                                      ((g0.get("offers") or [{}])[0].get("store_name") or "")),
+        "url": (product_link(g0["key"]) if g0.get("key") else SITE_URL + "/#raporti"),
+        "key": g0.get("key"),
     }, ensure_ascii=False)
     sent = 0
     for s in subs:
@@ -870,10 +916,16 @@ def send_daily_digest():
     if not drops:
         return 0
     lines = ["📰 <b>ÇmimRadar — top uljet e sotme</b>\n"]
+    # RREGULLUAR 2026-10-15: report.drops ka fushat title/prev/pct (jo name/old_price/drop_pct)
+    # — më parë digest-i dilte me emra bosh, "ishte —" dhe −0%.
     for d in drops[:5]:
-        lines.append("• <b>%s</b>\n  %s L <i>(ishte %s)</i> −%s%%" %
-                     ((d.get("name") or "")[:55], fmt_price(d.get("price")),
-                      fmt_price(d.get("old_price")), round(d.get("drop_pct", 0), 1)))
+        name = d.get("title") or d.get("name") or ""
+        old = d.get("prev") or d.get("old_price")
+        pct = d.get("pct") if d.get("pct") is not None else d.get("drop_pct", 0)
+        link = product_link(d["key"]) if d.get("key") else (d.get("url") or "")
+        lines.append("• <b>%s</b>\n  %s L <i>(ishte %s)</i> −%s%% · %s\n  %s" %
+                     (htmlmod.escape(name[:55]), fmt_price(d.get("price")), fmt_price(old),
+                      round(float(pct or 0), 1), htmlmod.escape(d.get("store_name") or ""), link))
     lines.append("\n🌐 " + SITE_URL)
     msg = "\n".join(lines)
     sent = 0
@@ -932,7 +984,7 @@ def every(name, seconds):
 def run_jobs():
     try:
         if every("heartbeat", HEARTBEAT_EVERY):
-            bs_request("POST", {"heartbeat": int(time.time())})
+            write_heartbeat()
         if every("data", DATA_TTL):
             refresh_data(force=True)
         # raport i ri? → admin summary (+ digest pas skanimit të mbrëmjes)
@@ -986,11 +1038,25 @@ def record_op(op):
 
 
 def flush_ops():
+    # Swap atomik (nën GIL): merr listën aktuale dhe lë një të zbrazët në vend.
+    # Më parë: iterate + .clear() mbi TË NJËJTËN listë globale — një op i
+    # regjistruar nga një thread tjetër GJATË flush-it pastrohej pa u dërguar
+    # (humbje e heshtur). Me swap-in, op-et e reja mbesin në listën e re për
+    # flush-in tjetër; çdo op dërgohet saktësisht një herë.
+    global PENDING_OPS
+    ops, PENDING_OPS = PENDING_OPS, []
     ok = True
-    for op in PENDING_OPS:
+    failed = []
+    for op in ops:
         if bs_request("POST", op) is None:
             ok = False
-    PENDING_OPS.clear()
+            failed.append(op)
+    if failed:
+        # RREGULLUAR 2026-10-17: op-et e dështuara (bot-state poshtë për një
+        # çast) më parë HUMBNIN përgjithmonë; tani rivihen në krye të radhës
+        # për flush-in tjetër (kapak 200 — hidhen më të vjetrat).
+        PENDING_OPS = (failed + PENDING_OPS)[:200]
+        print("  !! flush_ops: %d op-e u ruajtën për riprovë" % len(failed), flush=True)
     return ok
 
 
@@ -1042,6 +1108,9 @@ def run_webhook():
                     load_state_once()
                     handle_update(u)
                     flush_ops()
+                    # heartbeat oportunist: çdo update provon gjallërinë
+                    if every("heartbeat", HEARTBEAT_EVERY):
+                        write_heartbeat()
             except Exception:
                 print("  !! gabim në webhook:\n%s" % traceback.format_exc()[:400], flush=True)
             self.send_response(200)
@@ -1053,6 +1122,7 @@ def run_webhook():
             or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
     if base:
         wh_url = base + secret_path
+        register_commands()
         r = tg("setWebhook", {"url": wh_url, "max_connections": 40,
                               "secret_token": secret_token,
                               "allowed_updates": ["message", "callback_query"]})
@@ -1063,8 +1133,23 @@ def run_webhook():
     port = int(os.environ.get("PORT") or os.environ.get("SERVER_PORT", "10000"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print("Webhook server në portin %d." % port, flush=True)
-    # Në webhook mode NUK ka jobs loop: shërbimi fle kur s'ka mesazhe,
-    # kontrollet periodike (alarme, digest, përmbledhje admin) i bën cron-i i VM-së.
+    # Në webhook mode NUK ka jobs loop të plotë: kontrollet periodike
+    # (alarme, digest, përmbledhje admin) i bën cron-i i VM-së. POR heartbeat-i
+    # PO: një fije daemon e shkruan çdo HEARTBEAT_EVERY sa kohë procesi është
+    # zgjuar (rrënja B, 2026-10-15) + heartbeat oportunist në çdo update (lart).
+    # Kujdes: kur host-i falas e fle shërbimin, fija fle bashkë me procesin —
+    # heartbeat-i ndalon derisa një mesazh/webhook e zgjon sërish.
+    import threading
+
+    def _heartbeat_loop():
+        while True:
+            try:
+                write_heartbeat()
+            except Exception:
+                pass
+            time.sleep(HEARTBEAT_EVERY)
+
+    threading.Thread(target=_heartbeat_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1077,6 +1162,8 @@ def main():
     refresh_data(force=True)
     me = tg("getMe", {})
     print("Bot: %s" % ((me.get("result") or {}).get("username") if me else "?"), flush=True)
+    if not (os.environ.get("PORT") or os.environ.get("SERVER_PORT")):
+        register_commands()
     if os.environ.get("PORT") or os.environ.get("SERVER_PORT"):
         # webhook mode: pa mesazh "u ndez" (cold start-et janë të shpeshta)
         run_webhook()

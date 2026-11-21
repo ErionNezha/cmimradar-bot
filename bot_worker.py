@@ -1,24 +1,41 @@
 #!/usr/bin/env python3
-"""ÇmimRadar Bot — Render Background Worker (long polling 24/7).
+"""RADAR Bot — Render Background Worker (long polling 24/7).
 
 Përgjigjet në sekonda ("si robot"), i lidhur me website-in live
-(lexon products.json/report.json nga cmimradar.netlify.app).
+(lexon products.json/report.json/history.json nga cmimradar.netlify.app).
 
 Veçoritë:
-  🔍 kërkim çmimi me tekst të lirë
+  🔍 kërkim çmimi me tekst të lirë (kërkim i përbashkët me faqen)
+  🤖 "Pyet Radarin" — përgjigje me buxhet të fortë, vetëm produkte reale
   ⌨️ menu me butona (reply keyboard)
   🔥 /oferta — oferta e ditës
   📰 /digest — abonim në top-5 uljet e ditës
   🔔 alarme uljeje via deep-link (tg_/em_) + /alerts me butona fshirjeje
-  🎯 alarme push për produkte (via Netlify Blobs push-subscribe)
-  📸 oferta nga komuniteti (ruhen në bot-state function)
+  📸 oferta nga komuniteti (ruhen në bot-state function, statusi "në pritje")
   📊 përmbledhje admin kur del raport i ri
+
+Rregullat kanonike (çmimi më i lirë me dy nivele stoku, verdikti nga
+historia, kërkimi, formatimi, linket /p/<slug>-<id>) jetojnë në
+radar_logic.py — boti e importon si modul fqinj dhe e përdor kudo.
+Kur build.py / buy_signal.py shkruajnë fushat e reja në products.json
+(group["best"] / ["best_in_stock"] / ["verdict"]), boti i parapëlqen —
+"best" VETËM kur grupi ka edhe "best_in_stock" (shenja që Part A e
+ripërcaktoi best-in si çmimi më i lirë valid; best-i i vjetër pa
+best_in_stock NUK besohet kurrë, D4 2026-11-19); përndryshe i llogarit
+pastër me radar_logic. Të dyja rrugët japin të njëjtën përgjigje.
+
+Alarmet / digest / përmbledhja admin DËRGOHEN VETËM nga cron-i
+(check_remote_alerts.py, pas çdo skanimi). Kopjet e fjetura që ishin
+këtu (run_jobs, check_price_alerts, check_push_alerts, send_push_digest,
+send_daily_digest, admin_summary) u HOQËN më 2026-11-19 (bot-sync) —
+boti në webhook mode nuk i ekzekutonte kurrë. Këtu mbetet vetëm
+heartbeat-i, të cilin e lexon health_check C-BOT-2.
 
 State-i mbahet në Netlify Blobs via function-i `bot-state`
 (përndryshe disku efemer i Render-it do ta humbiste).
 
 Env vars (Render dashboard):
-  TG_BOT_TOKEN, VAPID_PRIVATE, BOT_KEY, TG_ADMIN_CHAT, SITE_URL
+  TG_BOT_TOKEN, BOT_KEY, TG_ADMIN_CHAT, SITE_URL
 """
 import base64
 import html as htmlmod
@@ -30,6 +47,8 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+
+import radar_logic
 
 def _load_dotenv():
     """Botkeep i ruan variablat në file-in .env (rrënja e projektit), jo në env të procesit.
@@ -53,22 +72,20 @@ _load_dotenv()
 
 # ---------------------------------------------------------------- config
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
-VAPID_PRIVATE = os.environ.get("VAPID_PRIVATE", "").strip()
 BOT_KEY = os.environ.get("BOT_KEY", "").strip()
 ADMIN_CHAT = os.environ.get("TG_ADMIN_CHAT", "").strip()
 SITE_URL = os.environ.get("SITE_URL", "https://cmimradar.netlify.app").rstrip("/")
 STATE_URL = SITE_URL + "/.netlify/functions/bot-state"
-PUSH_URL = SITE_URL + "/.netlify/functions/push-subscribe"
-PUSH_GAP_THRESHOLD = 20.0
 
 DATA_TTL = 15 * 60        # rifreskim të dhënash nga website
-PRICE_CHECK_EVERY = 20 * 60
 HEARTBEAT_EVERY = 5 * 60
-REPORT_WATCH_EVERY = 10 * 60
 
 for _v in ("TG_BOT_TOKEN", "BOT_KEY"):
     if not globals()[_v]:
         raise SystemExit("Mungon env var: " + _v)
+
+# Formatimi / linket vijnë nga radar_logic (rregullat kanonike, §2.6).
+fmt_price = radar_logic.fmt_price
 
 # ---------------------------------------------------------------- telegram
 def tg(method, payload, timeout=40):
@@ -154,6 +171,20 @@ def write_heartbeat():
     placeholder-i 1234567890 (2009). Tani e thërret edhe webhook mode."""
     return bs_request("POST", {"heartbeat": int(time.time())})
 
+
+_HEARTBEAT_LAST = 0.0
+
+
+def _heartbeat_due():
+    """True kur kanë kaluar HEARTBEAT_EVERY sekonda nga heartbeat-i i fundit
+    (zëvendëson every("heartbeat") të run_jobs() të hequr më 2026-11-19)."""
+    global _HEARTBEAT_LAST
+    now = time.time()
+    if now - _HEARTBEAT_LAST >= HEARTBEAT_EVERY:
+        _HEARTBEAT_LAST = now
+        return True
+    return False
+
 # ---------------------------------------------------------------- state (memory + flush)
 STATE = {}
 STATE_DIRTY = False
@@ -162,8 +193,7 @@ STATE_DIRTY = False
 def default_state():
     return {"offset": 0, "subs": [], "pending": {}, "digest_subs": [],
             "awaiting_search": [], "email_digest_subs": [],
-            "pending_newsletter": {}, "last_push_date": "",
-            "last_digest_date": "", "last_report_date": "", "store_fails": {}}
+            "pending_newsletter": {}}
 
 
 def load_state():
@@ -211,7 +241,8 @@ def mark_dirty():
     STATE_DIRTY = True
 
 # ---------------------------------------------------------------- website data
-DATA = {"products": None, "report": None, "ts": 0, "bykey": {}}
+DATA = {"products": None, "report": None, "history": {}, "ts": 0,
+        "bykey": {}, "merged": [], "aliases": {}, "drops_by_key": {}}
 
 
 def fetch_json(url):
@@ -228,14 +259,27 @@ def refresh_data(force=False):
         rep = fetch_json(SITE_URL + "/data/report.json")
         DATA["products"] = prods
         DATA["report"] = rep
-        bykey = {g["key"]: g for g in prods.get("groups", [])}
+        # historia: opsionale (nëse mungon, verdiktet dalin "Pa verdikt").
+        try:
+            DATA["history"] = fetch_json(SITE_URL + "/data/history.json") or {}
+        except Exception:
+            DATA["history"] = {}
+        # katalogu i bashkuar (si faqja): 19.497 -> 19.370 grupe.
+        merged, _n = radar_logic.merge_groups(prods.get("groups", []))
+        DATA["merged"] = merged
+        DATA["aliases"] = prods.get("aliases") or {}
+        bykey = {g["key"]: g for g in merged}
         # aliaset: çelësat e vjetër → grupi aktual (alarmet e vjetra s'humbasin)
-        for old, new in (prods.get("aliases") or {}).items():
+        for old, new in DATA["aliases"].items():
             if old not in bykey and new in bykey:
                 bykey[old] = bykey[new]
         DATA["bykey"] = bykey
+        # uljet e ditës sipas çelësit — për rreshtin "Ishte … (−…%)".
+        DATA["drops_by_key"] = {d.get("key"): d for d in (rep.get("drops") or [])
+                                if d.get("key")}
         DATA["ts"] = time.time()
-        print("Të dhënat u rifreskuan (%d grupe)." % len(DATA["bykey"]), flush=True)
+        print("Të dhënat u rifreskuan (%d grupe të bashkuara)." % len(DATA["bykey"]),
+              flush=True)
         return True
     except Exception as e:
         print("  !! refresh_data: %s" % str(e)[:150], flush=True)
@@ -249,8 +293,9 @@ MAIN_KB = {"keyboard": [
 ], "resize_keyboard": True}
 
 BOT_WELCOME = (
-    "👋 <b>Përshëndetje! Unë jam boti i ÇmimRadar-it</b> 🤖\n\n"
+    "👋 <b>Përshëndetje! Unë jam boti i RADAR-it</b> 🤖\n\n"
     "🔍 Më shkruaj emrin e produktit dhe të them <b>çmimin më të lirë</b> në Shqipëri.\n"
+    "🤖 Më pyet si <i>laptop për studentë nën 80 mijë</i> — të kthej vetëm produkte reale brenda buxhetit.\n"
     "🔔 Vendos <b>alarme uljeje</b> nga faqja — të njoftoj këtu sapo çmimi të bjerë.\n"
     "📸 Dërgomë <b>foto-ofertë</b> me <code>Produkti | Dyqani | Çmimi</code> — e publikojmë pas verifikimit.\n\n"
     "Përdor butonat më poshtë ose komandat:\n"
@@ -278,8 +323,10 @@ def register_commands():
 
 
 BOT_HELP = (
-    "❓ <b>Ndihma — ÇmimRadar Bot</b>\n\n"
+    "❓ <b>Ndihma — RADAR Bot</b>\n\n"
     "🔍 <b>Kërko:</b> shkruaj p.sh. <i>iphone 17</i> ose shtyp 🔍 Kërko.\n"
+    "🤖 <b>Pyet Radarin:</b> shkruaj pyetje si <i>laptop për studentë nën 80 mijë</i> ose "
+    "<i>kufje pa kabllo nën 10.000 lek</i> — buxheti është kufi i fortë, kthehen vetëm produkte reale.\n"
     "🔔 <b>Alarme:</b> nga faqja hap produktin → 🔔 <b>Alarm uljeje</b> → tabin <b>Telegram</b> → "
     "<b>Vazhdo</b> → <b>START</b> këtu. Fshihen me /alerts.\n"
     "🔥 <b>/oferta</b> — oferta e ditës.\n"
@@ -301,21 +348,14 @@ COMMUNITY_INSTR = (
 )
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-NORM_RE = re.compile(r"[^a-z0-9çë\s]")
-
-
-def norm(s):
-    return NORM_RE.sub(" ", (s or "").lower()).split()
-
-
-def fmt_price(p):
-    try:
-        return f"{float(p):,.0f}".replace(",", ".")
-    except Exception:
-        return "—"
 
 
 def product_link(key):
+    """Linku kanonik i produktit: /p/<slug>-<id> (si faqja).
+    Bie mbrapa te /?p=<key> kur grupi s'gjendet."""
+    g = DATA["bykey"].get(str(key))
+    if g:
+        return radar_logic.product_url(g)
     return SITE_URL + "/?p=" + urllib.parse.quote(str(key))
 
 
@@ -323,57 +363,182 @@ def user_subs(chat_id):
     return [s for s in STATE.get("subs", [])
             if s.get("channel") == "telegram" and str(s.get("chat_id")) == str(chat_id)]
 
+
+def _fmt_pct(p):
+    """Përqindje me 1 dhjetore, presje dhjetore shqipe: 15.6 -> '15,6'."""
+    try:
+        return ("%.1f" % float(p)).replace(".", ",")
+    except Exception:
+        return "—"
+
+
+def trunc_word(s, n):
+    """Pret titullin në <=n karaktere, në kufi fjale, me '…' kur pritet.
+
+    (Bug /top 2026-11-20: titujt priteshin në mes të fjalës, p.sh.
+    '…Full HD, Smart, i' / '…Techly I-SMART-GRAV, m', pa '…'.)
+    Kthehet te hapësira e fundit brenda prerjes; hiqen shenjat e
+    pikësimit në fund para '…'. Një fjalë e vetme më e gjatë se n
+    pritet fort në n + '…'. Titujt <= n karaktere kthehen të paprekur.
+    """
+    s = s or ""
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    i = cut.rfind(" ")
+    if i > 0:
+        cut = cut[:i]
+    cut = cut.rstrip(" \t,;:.-–—")
+    return cut + "…"
+
+
+def _canonical_cheapest(g):
+    """(cheapest, cheapest_in_stock) — dy nivelet e stokut (§2.1).
+
+    Parapëlqehen fushat e skanerit (group["best"] / ["best_in_stock"],
+    radar_logic.scanner_cheapest) kur ekzistojnë DHE grupi s'është i
+    bashkuar; "best" besohet VETËM kur grupi ka edhe "best_in_stock"
+    (shenja që Part A e ripërcaktoi best-in si cheapest_valid — D4:
+    boti lexonte group["cheapest"], të cilin skaneri s'e shkruan kurrë,
+    ndaj rruga e skanerit s'ndizej kurrë). Për grupet e bashkuara
+    (ofertat vijnë nga disa grupe burim) dhe kur fushat mungojnë / janë
+    None, llogariten pastër me radar_logic. KURRË group["best"] i vjetër
+    pa "best_in_stock" — ai mund të jetë ofertë pa stok (p.sh. REDMI
+    NOTE 15 PRO+ 22.990 L).
+    """
+    if g.get("_merged"):
+        return (radar_logic.cheapest_valid(g),
+                radar_logic.cheapest_in_stock(g))
+    best, bis = radar_logic.scanner_cheapest(g)
+    ch = best if best is not None else radar_logic.cheapest_valid(g)
+    ins = bis if bis is not None else radar_logic.cheapest_in_stock(g)
+    return ch, ins
+
+
+def _verdict_for_group(g, cheapest_price):
+    """(label, reason) ose (None, None). Verdikti vjen vetëm nga historia.
+
+    Parapëlqehet group["verdict"] i skanerit (kur grupi s'është i bashkuar);
+    arsyeja llogaritet gjithmonë nga historia, me çmimin më të lirë valid
+    si `current`. Pa histori (ose < 2 pika) → (None, None), përveç kur
+    skaneri ka verdikt (historia mungon lokalisht) — atëherë kthehet
+    verdikti i skanerit me arsye gjenerike.
+    """
+    key = g.get("key", "")
+    hgroups = (DATA.get("history") or {}).get("groups", {}) or {}
+    entry = hgroups.get(key) if isinstance(hgroups, dict) else None
+    hist = (entry or {}).get("history") or []
+    if hist and len(hist) >= 2 and cheapest_price:
+        prices = [p for _d, p in hist if p]
+        mn = min(prices) if prices else None
+        week_ago = hist[-8][1] if len(hist) > 7 else hist[0][1]
+        chg7 = ((cheapest_price - week_ago) / week_ago * 100) if week_ago else 0
+        label = None
+        if not g.get("_merged"):
+            label = radar_logic.scanner_verdict(g)
+        if label is None:
+            label = radar_logic.verdict_for(hist, current=cheapest_price)
+        if label == "SHMANG":
+            reason = "Çmimi u rrit %s%% kundrejt 7 ditëve më parë." % _fmt_pct(chg7)
+        elif label == "BLI TANI":
+            if mn:
+                reason = ("Çmimi sot është te minimumi historik (%s L)."
+                          % fmt_price(mn))
+            else:
+                reason = "Çmimi sot është ndër më të ulëtit historik."
+        elif label == "FLAT":
+            # A3 (site rule): histori e sheshtë — çmimi s'ka lëvizur kurrë,
+            # ndaj s'ka bazë për BLI TANI. Shfaqet si "Çmim i qëndrueshëm"
+            # (e njëjta etiketë gri si faqja), jo si verdikt blerjeje.
+            return ("Çmim i qëndrueshëm",
+                    "Çmimi nuk ka lëvizur në historinë e regjistruar.")
+        elif label == "PRIT":
+            if mn:
+                reason = ("Minimumi historik është %s L — sot %s L."
+                          % (fmt_price(mn), fmt_price(cheapest_price)))
+            else:
+                reason = "Çmimi nuk është te minimumi historik."
+        else:
+            return None, None
+        return label, reason
+    if not g.get("_merged"):
+        label = radar_logic.scanner_verdict(g)
+        if label:
+            if label == "FLAT":
+                return ("Çmim i qëndrueshëm",
+                        "Çmimi nuk ka lëvizur në historinë e regjistruar.")
+            generic = {"BLI TANI": "Çmimi është ndër më të ulëtit historik.",
+                       "PRIT": "Çmimi nuk është te minimumi historik.",
+                       "SHMANG": "Çmimi është rritur ndjeshëm së fundmi."}
+            return label, generic.get(label, "")
+    return None, None
+
+
+_VERDICT_PILL = {"BLI TANI": "🟢", "PRIT": "🟡", "SHMANG": "🔴",
+                   "Çmim i qëndrueshëm": "⚪"}
+
 # ---------------------------------------------------------------- kërkimi
 def search_products(query, limit=5):
-    words = [w for w in norm(query) if len(w) > 1]
-    if not words:
+    """Kërkimi i përbashkët me faqen, mbi grupet e BASHKUARA:
+    sinonime, fraza, numra të detyrueshëm (ps5 ≠ ps4), përjashtim
+    aksesorësh kur pyetja emëron një klasë pajisjeje; renditja: përputhje
+    kategorie, pastaj fillim titulli, pastaj çmimi më i lirë."""
+    if not DATA.get("merged"):
         return []
-    scored = []
-    for g in DATA["bykey"].values():
-        tw = [t for t in norm(g.get("title", "")) if len(t) > 1]
-        if not tw:
-            continue
-        hit = 0
-        for w in words:
-            for t in tw:
-                if w == t or (len(w) >= 4 and w in t) or (len(t) >= 4 and t in w):
-                    hit += 1
-                    break
-        if hit == 0:
-            continue
-        # pikë: sa fjalë u gjetën + bonus për titull të shkurtër (më i saktë)
-        score = hit * 10 - len(tw) * 0.05
-        best = g.get("best") or {}
-        if best.get("price"):
-            score += 2
-        score += min(int(g.get("n_stores") or 1), 10) * 0.3   # krahasim mes më shumë dyqanesh
-        if g.get("condition") == "used":
-            score -= 1
-        scored.append((score, g))
-    scored.sort(key=lambda x: -x[0])
-    return [g for _, g in scored[:limit]]
+    return [g for g, _c in radar_logic.search_ranked(
+        DATA["merged"], query, DATA.get("aliases"), limit=limit)]
 
 
 def format_product(g, key):
-    best = g.get("best") or {}
-    price = best.get("price")
-    store = best.get("store_name", "")
-    offers = g.get("offers", [])
-    lines = ["🔎 <b>%s</b>" % (g.get("title", "")[:90])]
-    if price:
-        lines.append("💰 <b>%s L</b> te <b>%s</b>" % (fmt_price(price), store))
-        if len(offers) > 1:
-            mx = max(o.get("price", 0) for o in offers)
+    cheapest, in_stock = _canonical_cheapest(g)
+    comp = radar_logic.comparable_offers(g)
+    lines = ["🔎 <b>%s</b>" % trunc_word(g.get("title", ""), 90)]
+    if cheapest and cheapest.get("price"):
+        price = cheapest["price"]
+        store = cheapest.get("store_name", "")
+        stock_note = ""
+        if cheapest.get("in_stock") is None:
+            stock_note = " (stoku i pakonfirmuar)"
+        lines.append("💰 <b>%s L</b> te <b>%s</b> · Më i liri%s" %
+                     (fmt_price(price), store, stock_note))
+        if (in_stock and in_stock.get("price")
+                and (in_stock.get("store") != cheapest.get("store")
+                     or in_stock.get("price") != price)):
+            lines.append("Më i liri në stok: <b>%s L</b> te <b>%s</b>" %
+                         (fmt_price(in_stock["price"]),
+                          in_stock.get("store_name", "")))
+        if len(comp) > 1:
+            mx = max(o.get("price", 0) for o in comp)
             if mx and mx > price:
                 lines.append("📊 %d dyqane · diferenca %s%%" %
-                             (len(offers), round((mx - price) / mx * 100, 1)))
-        sig = g.get("buy_signal")
-        if sig == "rekord":
-            lines.append("🔥 <b>BLEJ TANI</b> — çmimi më i ulët ndonjëherë!")
-        elif sig == "mire":
-            lines.append("✅ <b>Çmim i mirë</b> — ndër më të ulëtit historik.")
-        elif sig == "shtrenjte":
-            lines.append("⏳ <b>Prit</b> — çmimi është i lartë tani.")
+                             (len(comp), _fmt_pct((mx - price) / mx * 100)))
+        # etiketat: çmim i dyshimtë / vitrinë / i përdorur (ku zbatohen)
+        med = radar_logic.group_median(g)
+        offers = g.get("offers", [])
+        if any(radar_logic.is_suspicious(o, med) for o in offers):
+            lines.append("⚠️ Çmim i dyshimtë")
+        if any(radar_logic.is_vitrine(o, g.get("title", "")) for o in offers):
+            lines.append("🏷️ Vitrinë")
+        if (any(radar_logic.is_used(o, g.get("title", "")) for o in offers)
+                or g.get("condition") == "used"):
+            lines.append("♻️ I përdorur")
+        # "Ishte …" — VETËM nga report drops (prev i djeshëm), kurrë nga old_price.
+        drop = DATA.get("drops_by_key", {}).get(key)
+        if drop and drop.get("prev") and drop["prev"] > price:
+            pct = drop.get("pct")
+            if pct is None:
+                pct = radar_logic.discount_pct(price, drop["prev"])
+            lines.append("📉 Ishte %s L (−%s%%)" %
+                         (fmt_price(drop["prev"]), _fmt_pct(pct)))
+        label, reason = _verdict_for_group(g, price)
+        if label:
+            lines.append("%s <b>%s</b> — %s" %
+                         (_VERDICT_PILL.get(label, "⚪"), label, reason))
+        else:
+            lines.append("Pa verdikt · pa histori")
+        if cheapest.get("url"):
+            lines.append('🛒 <a href="%s">Bli te %s ↗</a>' %
+                         (htmlmod.escape(cheapest["url"]), store))
     else:
         lines.append("⏳ Pa çmime ende në radar.")
     lines.append('🔗 <a href="%s">Shiko në faqe</a>' % product_link(key))
@@ -393,9 +558,129 @@ def handle_search(chat_id, query):
     g = res[0]
     tg_send(chat_id, format_product(g, g["key"]), preview=True)
     if len(res) > 1:
-        btns = [[{"text": ("✅ " if i == 0 else "") + r["title"][:40],
-                  "callback_data": "prod:%s" % r["key"]}] for i, r in enumerate(res[1:5])]
+        btns = [[{"text": ("✅ " if i == 0 else "") + trunc_word(r["title"], 40),
+                  # F-6.1 (2026-11-20): pronari (chat-i që e nisi kërkimin)
+                  # shkruhet në callback_data — handle_callback e verifikon.
+                  "callback_data": "prod:%s:%s" % (r["key"], chat_id)}] for i, r in enumerate(res[1:5])]
         tg_send(chat_id, "🔎 <b>Rezultate të tjera:</b>", markup={"inline_keyboard": btns})
+
+
+# ---------------------------------------------------------------- "Pyet Radarin" (AI)
+_AI_RE = re.compile(
+    r"më i liri|ku është më lirë|cheapest|best|sa kushton|cili|cila|"
+    r"nën|deri|under|për student|student", re.IGNORECASE)
+
+
+def _fx():
+    """(rate, date) e kursit EUR→LEK nga report.json i ngarkuar, ose
+    (None, None) kur të dhënat s'janë ngarkuar ende. Kurrë kurs i shpikur."""
+    rep = DATA.get("report") or {}
+    fx = (rep.get("fx") or {}).get("EUR_ALL")
+    date = (rep.get("fx") or {}).get("date")
+    try:
+        return (float(fx), date) if fx else (None, None)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def _budget_line(res, lang):
+    """'800 € (≈72.094 L · kursi 90,12 · 2026-11-20)' kur buxheti erdhi nga
+    EUR (V7: kursi citohet gjithmonë); None për buxhet në lekë/pa buxhet."""
+    if not res.get("budget_eur") or not res.get("fx") or not res.get("budget"):
+        return None
+    dec = "," if lang == "sq" else "."
+    word = "kursi" if lang == "sq" else "rate"
+    rate_s = ("%.2f" % res["fx"]).replace(".", dec)
+    date_s = (" · " + res["fx_date"]) if res.get("fx_date") else ""
+    return "%s € (≈%s L · %s %s%s)" % (
+        fmt_price(res["budget_eur"]), fmt_price(res["budget"]),
+        word, rate_s, date_s)
+
+
+def _is_ai_query(txt):
+    """Pyetje me buxhet OSE me model pyetjeje → answer_ai(); përndryshe
+    kërkim me fjalë kyçe (top 5)."""
+    fx, _date = _fx()
+    if radar_logic.parse_budget(txt, fx=fx) is not None:
+        return True
+    return bool(_AI_RE.search(txt or ""))
+
+
+def handle_ai(chat_id, query):
+    if not refresh_data():
+        tg_send(chat_id, "⚠️ S'munda të lexoj të dhënat e faqes. Provo pas pak.")
+        return
+    fx, fx_date = _fx()
+    res = radar_logic.answer_ai(DATA["merged"], query, DATA.get("aliases"),
+                                fx=fx, fx_date=fx_date)
+    lang = res["lang"]
+    picks = res["picks"]
+    if picks:
+        header = ("🤖 <b>RADAR — përgjigjja</b>\n" if lang == "sq"
+                  else "🤖 <b>RADAR — answer</b>\n")
+        lines = [header]
+        bl = _budget_line(res, lang)
+        if bl:
+            lines.append(("Buxheti: " if lang == "sq" else "Budget: ") + bl + "\n")
+        for i, p in enumerate(picks, 1):
+            g, offer = p["group"], p["offer"]
+            stock = ""
+            if offer.get("in_stock") is None:
+                stock = (" · stoku i pakonfirmuar" if lang == "sq"
+                         else " · stock unconfirmed")
+            label, _reason = _verdict_for_group(g, offer["price"])
+            lines.append("<b>%d. %s</b>" % (i, trunc_word(g.get("title", ""), 90)))
+            lines.append("💰 <b>%s L</b> te <b>%s</b>%s" %
+                         (fmt_price(offer["price"]),
+                          offer.get("store_name", ""), stock))
+            lines.append(p["reason"])
+            if label:
+                lines.append("%s <b>%s</b>" %
+                             (_VERDICT_PILL.get(label, "⚪"), label))
+            lines.append('🔗 <a href="%s">Shiko</a>' %
+                         radar_logic.product_url(g))
+            lines.append("")
+        tg_send(chat_id, "\n".join(lines).strip(), preview=True)
+        return
+    fb = res["fallback"]
+    budget = radar_logic.parse_budget(query, fx=fx)
+    if fb:
+        g, offer = fb["group"], fb["offer"]
+        btxt = (_budget_line(res, lang)
+                or (("%s L" % fmt_price(budget)) if budget else "—"))
+        if lang == "en":
+            text = ("Nothing under <b>%s</b> — the cheapest real option is:\n\n"
+                    "<b>%s</b>\n💰 <b>%s L</b> at <b>%s</b>\n"
+                    '🔗 <a href="%s">View</a>' %
+                    (btxt,
+                     trunc_word(g.get("title", ""), 90), fmt_price(offer["price"]),
+                     offer.get("store_name", ""), radar_logic.product_url(g)))
+        else:
+            text = ("Nuk gjeta asgjë nën <b>%s</b>. Më i liri real është:\n\n"
+                    "<b>%s</b>\n💰 <b>%s L</b> te <b>%s</b>\n"
+                    '🔗 <a href="%s">Shiko</a>' %
+                    (btxt,
+                     trunc_word(g.get("title", ""), 90), fmt_price(offer["price"]),
+                     offer.get("store_name", ""), radar_logic.product_url(g)))
+        tg_send(chat_id, text, preview=True)
+        return
+    if lang == "en":
+        tg_send(chat_id,
+                "I couldn't find real products for that request.\n\n"
+                "Try fewer words (e.g. <i>iphone 17</i>) or check the site: %s"
+                % SITE_URL)
+    else:
+        tg_send(chat_id,
+                "Nuk gjeta produkte reale për këtë kërkesë.\n\n"
+                "Provo me më pak fjalë (p.sh. <i>iphone 17</i>) "
+                "ose shiko faqen: %s" % SITE_URL)
+
+
+def handle_free_text(chat_id, txt):
+    if _is_ai_query(txt):
+        handle_ai(chat_id, txt)
+    else:
+        handle_search(chat_id, txt)
 
 # ---------------------------------------------------------------- komandat
 def cmd_oferta(chat_id):
@@ -407,17 +692,23 @@ def cmd_oferta(chat_id):
     if not dod:
         tg_send(chat_id, "🔥 S'ka ofertë të ditës sot. Kthehu nesër!")
         return
-    name = dod.get("name", "")[:90]
-    price = dod.get("price")
+    name = trunc_word(dod.get("name", ""), 90)
+    # RREGULLUAR 2026-11-19 (bot-sync, bug 1): deal_of_day NUK ka fushë
+    # "price" — çmimi është "new_price", i vjetri "old_price" (prev),
+    # ulja "pct". Më parë asnjë rresht çmimi s'dilnte kurrë.
+    price = dod.get("new_price")
     store = dod.get("store_name", "")
     old = dod.get("old_price")
+    pct = dod.get("pct")
     key = dod.get("key", "")
     lines = ["🔥 <b>OFERTA E DITËS</b>\n", "🏷️ <b>%s</b>" % name]
     if price:
         lines.append("💰 <b>%s L</b> te <b>%s</b>" % (fmt_price(price), store))
     if old and price and old > price:
+        if pct is None:
+            pct = radar_logic.discount_pct(price, old)
         lines.append("📉 Ishte %s L (−%s%%)" %
-                     (fmt_price(old), round((old - price) / old * 100, 1)))
+                     (fmt_price(old), _fmt_pct(pct)))
     if key:
         lines.append('🔗 <a href="%s">Shiko në faqe</a>' % product_link(key))
     tg_send(chat_id, "\n".join(lines), preview=True)
@@ -468,17 +759,20 @@ def cmd_top(chat_id):
     if not drops:
         tg_send(chat_id, "📊 S'ka ulje sot. Kthehu nesër!")
         return
+    # RREGULLUAR 2026-11-19 (bot-sync, bug 2): pct/prev merren nga report-i
+    # (ulja ditë-me-ditë). KURRË nuk rillogaritet nga store old_price —
+    # për Maus DM210 jepte −33,3% në vend të −15,6%.
     lines = ["🏆 <b>TOP 10 ULJET E DITËS</b>\n"]
     for i, d in enumerate(drops[:10], 1):
-        title = (d.get("title") or "")[:55]
+        title = trunc_word(d.get("title") or "", 55)
         price = d.get("price")
-        old = d.get("old_price")
         store = d.get("store_name", "")
-        pct = ""
-        if old and price and old > price:
-            pct = " (−%s%%)" % round((old - price) / old * 100, 1)
+        pct = d.get("pct")
+        if pct is None and d.get("prev") and price:
+            pct = radar_logic.discount_pct(price, d["prev"])
+        pct_txt = (" (−%s%%)" % _fmt_pct(pct)) if pct is not None else ""
         lines.append("%d. <b>%s</b>\n   💰 %s L%s te %s" % (
-            i, title, fmt_price(price), pct, store))
+            i, title, fmt_price(price), pct_txt, store))
     tg_send(chat_id, "\n".join(lines))
 
 
@@ -492,8 +786,8 @@ def send_alerts_list(chat_id):
     lines = ["📋 <b>Alarmet e tua aktive (%d):</b>\n" % len(al)]
     btns = []
     for s in al[:20]:
-        lines.append("• <b>%s</b>\n  synim ≤ <b>%s L</b>" % (s["name"][:60], fmt_price(s["target"])))
-        btns.append([{"text": "❌ %s" % s["name"][:28],
+        lines.append("• <b>%s</b>\n  synim ≤ <b>%s L</b>" % (trunc_word(s["name"], 60), fmt_price(s["target"])))
+        btns.append([{"text": "❌ %s" % trunc_word(s["name"], 28),
                       "callback_data": "del:%s:%d" % (s["key"], s["target"])}])
     tg_send(chat_id, "\n".join(lines), markup={"inline_keyboard": btns})
 
@@ -519,7 +813,17 @@ def handle_callback(cb):
         if removed:
             tg_send(chat_id, "🗑️ <b>Alarmi u fshi.</b>\nMund të vendosësh të ri nga faqja kur të duash. 🔔")
     elif data.startswith("prod:"):
-        key = data.split(":", 1)[1]
+        parts = data.split(":")
+        key = parts[1] if len(parts) > 1 else ""
+        owner = parts[2] if len(parts) > 2 else ""
+        # F-6.1 (2026-11-20): callback-i i përket vetëm chat-it që e nisi
+        # kërkimin (pronari shkruhet në callback_data nga handle_search).
+        # Format i vjetër "prod:<key>" (pa pronar, dërguar para fix-it)
+        # pranohet — fail-open vetëm për butona të vjetër; me pronar të
+        # shënuar, një chat tjetër refuzohet (butoni i përcjellë s'punon).
+        if owner and owner != str(chat_id):
+            tg_answer_callback(cb_id, "Ky buton i përket një bisede tjetër.")
+            return
         g = DATA["bykey"].get(key)
         tg_answer_callback(cb_id)
         if g:
@@ -548,7 +852,7 @@ def handle_deeplink(chat_id, payload):
     if kind == "tg":
         subs = STATE.setdefault("subs", [])
         new_sub = {"channel": "telegram", "chat_id": chat_id, "key": key,
-                   "target": target, "name": g["title"][:80]}
+                   "target": target, "name": trunc_word(g["title"], 80)}
         exists = any(s.get("channel") == "telegram"
                      and str(s.get("chat_id")) == str(chat_id)
                      and s.get("key") == key and s.get("target") == target
@@ -557,23 +861,24 @@ def handle_deeplink(chat_id, payload):
             subs.append(new_sub)
             mark_dirty()
             record_op({"sub_add": new_sub})
+        cheapest, _ins = _canonical_cheapest(g)
+        now_txt = ("Çmimi tani: %s L te %s." % (
+            fmt_price(cheapest["price"]), cheapest.get("store_name", ""))
+            if cheapest and cheapest.get("price") else "")
         tg_send(chat_id,
                 "✅ <b>Alarmi u aktivizua!</b>\n\n<b>%s</b>\n"
                 "Do të njoftohesh këtu kur çmimi të bjerë në <b>%s L</b> ose më pak.\n\n" % (
-                    g["title"][:80], fmt_price(target)) +
-                ("Ky alarm ekzistonte tashmë — nuk u dyfishua." if exists else
-                 "Çmimi tani: %s L te %s." % (
-                     fmt_price((g.get("best") or {}).get("price")),
-                     (g.get("best") or {}).get("store_name", ""))),
+                    trunc_word(g["title"], 80), fmt_price(target)) +
+                ("Ky alarm ekzistonte tashmë — nuk u dyfishua." if exists else now_txt),
                 markup=MAIN_KB)
     else:
-        pend = {"key": key, "target": target, "name": g["title"][:80]}
+        pend = {"key": key, "target": target, "name": trunc_word(g["title"], 80)}
         STATE.setdefault("pending", {})[str(chat_id)] = pend
         mark_dirty()
         record_op({"pending_put": {"chat_id": str(chat_id), "data": pend}})
         tg_send(chat_id,
                 "📧 <b>%s</b>\n\nShkruaj <b>email-in tënd</b> si mesazh këtu që ta "
-                "konfirmojmë alarmin (synimi: %s L)." % (g["title"][:80], fmt_price(target)))
+                "konfirmojmë alarmin (synimi: %s L)." % (trunc_word(g["title"], 80), fmt_price(target)))
 
 
 def handle_community_photo(chat_id, m):
@@ -590,6 +895,16 @@ def handle_community_photo(chat_id, m):
         if pm:
             digits = re.sub(r"[^\d]", "", pm.group(0))
             price = int(digits) if digits else None
+    # F-6.2 (2026-11-20): foto pa emër produkti (caption bosh, ose caption
+    # që nis me "|" — p.sh. "| Dyqani | 100") NUK ruhet si "(pa emër)".
+    # Refuzohet me udhëzimin e formatit, para shkarkimit/ruajtjes; kthehet
+    # True që handle_message të mos bjerë në trajtimin e tekstit.
+    if not product:
+        tg_send(chat_id,
+                "📸 Foto pa emër produkti — dërgoje sërish me përshkrimin:\n\n"
+                "<code>Produkti | Dyqani | Çmimi</code>\n"
+                "Shembull: <i>iPhone 17 256GB | DyqanX | 145000</i>")
+        return True
     fid = photos[-1]["file_id"]
     fpath = tg_get_file(fid)
     data = tg_download_file(fpath) if fpath else None
@@ -597,12 +912,13 @@ def handle_community_photo(chat_id, m):
     ok = bool(bs_photo_put({
         "id": pid, "chat_id": chat_id, "product": product, "store": store,
         "price": price, "caption": cap, "date": time.strftime("%Y-%m-%d %H:%M"),
+        "status": radar_logic.STATUS_PENDING,
         "data_b64": base64.b64encode(data).decode() if data else ""}))
     tg_send(chat_id,
             ("📸 <b>Oferta u mor!</b>\n\n" if ok else "📸 <b>Oferta u mor, por fotoja s'u ruajt!</b>\n\n") +
             "<b>%s</b>%s%s\n\n"
-            "Do ta verifikojmë dhe publikojmë te “Oferta nga komuniteti” "
-            "sa më shpejt. Faleminderit! 🤝" %
+            "Statusi: <b>në pritje</b> — do ta verifikojmë dhe publikojmë "
+            "te “Oferta nga komuniteti” sa më shpejt. Faleminderit! 🤝" %
             (product or "(pa emër)",
              " — " + store if store else "",
              " — " + fmt_price(price) + " L" if price else ""))
@@ -625,7 +941,7 @@ def handle_message(m):
         STATE["awaiting_search"] = [x for x in STATE["awaiting_search"] if str(x) != str(chat_id)]
         mark_dirty()
         record_op({"awaiting_del": str(chat_id)})
-        handle_search(chat_id, txt)
+        handle_free_text(chat_id, txt)
         return
 
     # butonat e menysë
@@ -720,8 +1036,8 @@ def handle_message(m):
             tg_send(chat_id, "❌ Ky s'duket email i vlefshëm. Shkruaje sërish, p.sh. emri@shembull.com")
         return
 
-    # tekst i lirë → kërkim
-    handle_search(chat_id, txt)
+    # tekst i lirë → "Pyet Radarin" (me buxhet/pyetje) ose kërkim me fjalë kyçe
+    handle_free_text(chat_id, txt)
 
 
 def handle_update(u):
@@ -736,279 +1052,17 @@ def handle_update(u):
         print("  !! gabim në update %s:\n%s" %
               (u.get("update_id"), traceback.format_exc()[:500]), flush=True)
 
-# ---------------------------------------------------------------- njoftimet (alarme çmimesh)
-def send_email(to, subject, body):
-    import subprocess
-    r = subprocess.run(["hatch_gws_cli", "gmail", "+send", "--to", to,
-                        "--subject", subject, "--body", body],
-                       capture_output=True, text=True, timeout=60)
-    ok = r.returncode == 0
-    if not ok:
-        print("  !! email dështoi për %s: %s" % (to, (r.stderr or r.stdout)[:150]), flush=True)
-    return ok
-
-
-def check_price_alerts():
-    if not refresh_data():
-        return 0
-    sent, keep = 0, []
-    for s in STATE.get("subs", []):
-        g = DATA["bykey"].get(s.get("key"))
-        if not g or not g.get("best"):
-            keep.append(s)
-            continue
-        price = g["best"]["price"]
-        if price and price <= s["target"]:
-            store = g["best"].get("store_name", "")
-            url = g["best"].get("url", "")
-            if s["channel"] == "telegram":
-                ok = tg_send(s["chat_id"],
-                             "🎯 <b>ÇmimRadar — alarmi u aktivizua!</b>\n\n"
-                             "<b>%s</b>\nZbriti në <b>%s L</b> te <b>%s</b> "
-                             "(synimi: %s L).\n%s" %
-                             (s["name"], fmt_price(price), store, fmt_price(s["target"]), url))
-            else:
-                ok = send_email(s["email"],
-                                "🎯 ÇmimRadar: %s zbriti në %s L" % (s["name"][:50], fmt_price(price)),
-                                "%s\nZbriti në %s L te %s (synimi: %s L).\n%s" %
-                                (s["name"], fmt_price(price), store, fmt_price(s["target"]), url))
-            if ok:
-                sent += 1
-                time.sleep(1)
-            else:
-                keep.append(s)
-        else:
-            keep.append(s)
-    if len(keep) != len(STATE.get("subs", [])):
-        STATE["subs"] = keep
-        mark_dirty()
-    return sent
-
-# ---------------------------------------------------------------- push
-def push_blobs_get():
-    try:
-        req = urllib.request.Request(PUSH_URL, headers={"x-push-key": BOT_KEY}, method="GET")
-        with urllib.request.urlopen(req, timeout=30) as r:
-            d = json.load(r)
-        if isinstance(d, dict):
-            return d.get("subs") or [], d.get("alerts") or []
-    except Exception as e:
-        print("  !! push_blobs_get: %s" % str(e)[:120], flush=True)
-    return [], []
-
-
-def push_blobs_delete(endpoint=None, alert=None):
-    try:
-        body = {"push_alert_del": alert} if alert else {"endpoint": endpoint}
-        data = json.dumps(body).encode()
-        req = urllib.request.Request(PUSH_URL, data=data,
-                                     headers={"Content-Type": "application/json",
-                                              "x-push-key": BOT_KEY}, method="DELETE")
-        with urllib.request.urlopen(req, timeout=30):
-            pass
-        return True
-    except Exception as e:
-        print("  !! push_blobs_delete: %s" % str(e)[:120], flush=True)
-        return False
-
-
-def webpush_send(sub, payload):
-    try:
-        from pywebpush import webpush, WebPushException
-    except ImportError:
-        print("  !! pywebpush mungon", flush=True)
-        return False, False
-    if not VAPID_PRIVATE:
-        print("  !! VAPID_PRIVATE mungon", flush=True)
-        return False, False
-    try:
-        webpush(sub, payload, vapid_private_key=VAPID_PRIVATE,
-                vapid_claims={"sub": "mailto:admin@cmimradar.netlify.app"})
-        return True, False
-    except Exception as e:
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        print("  !! push %s: %s" % (code, str(e)[:100]), flush=True)
-        return False, code in (404, 410)
-
-
-def check_push_alerts():
-    subs, alerts = push_blobs_get()
-    if not alerts or not refresh_data():
-        return 0
-    sent = 0
-    for a in alerts:
-        g = DATA["bykey"].get(a.get("key"))
-        ep = a.get("endpoint", "")
-        if not g or not g.get("best"):
-            continue
-        price = g["best"]["price"]
-        target = a.get("target") or 0
-        if price and price <= target:
-            name = (a.get("name") or g.get("title", ""))[:60]
-            payload = json.dumps({
-                "title": "🎯 ÇmimRadar: %s zbriti!" % name,
-                "body": "%s L te %s (synimi: %s L)" %
-                        (fmt_price(price), g["best"].get("store_name", ""), fmt_price(target)),
-                "url": product_link(a["key"]),
-            }, ensure_ascii=False)
-            ok, dead = webpush_send({"endpoint": ep, "keys": a.get("keys") or {}}, payload)
-            if ok:
-                sent += 1
-            if dead:
-                push_blobs_delete(endpoint=ep)
-            if ok or dead:
-                push_blobs_delete(alert={"endpoint": ep, "key": a["key"]})
-            time.sleep(0.3)
-    return sent
-
-
-def send_push_digest():
-    from datetime import date
-    today = date.today().isoformat()
-    if STATE.get("last_push_date") == today:
-        return 0
-    subs, _ = push_blobs_get()
-    if not subs or not refresh_data():
-        return 0
-    rep = DATA["report"] or {}
-    gaps = rep.get("biggest_gaps") or []
-    if not gaps:
-        return 0
-    try:
-        pct = float(gaps[0].get("gap_pct") or 0)
-        save = float(gaps[0].get("save_pct") or 0)
-    except Exception:
-        return 0
-    if pct < PUSH_GAP_THRESHOLD:
-        return 0
-    g0 = gaps[0]
-    payload = json.dumps({
-        "title": ("🔥 Kurse %.0f%% te i njëjti produkt!" % save) if save else ("🔥 ÇmimRadar: %.1f%% diferencë!" % pct),
-        "body": "%s — %s L te %s." % ((g0.get("name") or "")[:50], fmt_price(g0.get("min_price")),
-                                      ((g0.get("offers") or [{}])[0].get("store_name") or "")),
-        "url": (product_link(g0["key"]) if g0.get("key") else SITE_URL + "/#raporti"),
-        "key": g0.get("key"),
-    }, ensure_ascii=False)
-    sent = 0
-    for s in subs:
-        ok, dead = webpush_send(s, payload)
-        if ok:
-            sent += 1
-        elif dead:
-            push_blobs_delete(endpoint=s.get("endpoint", ""))
-        time.sleep(0.3)
-    if sent:
-        STATE["last_push_date"] = today
-        mark_dirty()
-    return sent
-
-# ---------------------------------------------------------------- digest ditor
-def send_daily_digest():
-    from datetime import date
-    today = date.today().isoformat()
-    if STATE.get("last_digest_date") == today:
-        return 0
-    subs = [str(x) for x in STATE.get("digest_subs", [])]
-    if not subs or not refresh_data():
-        return 0
-    rep = DATA["report"] or {}
-    drops = rep.get("drops") or []
-    if not drops:
-        return 0
-    lines = ["📰 <b>ÇmimRadar — top uljet e sotme</b>\n"]
-    # RREGULLUAR 2026-10-15: report.drops ka fushat title/prev/pct (jo name/old_price/drop_pct)
-    # — më parë digest-i dilte me emra bosh, "ishte —" dhe −0%.
-    for d in drops[:5]:
-        name = d.get("title") or d.get("name") or ""
-        old = d.get("prev") or d.get("old_price")
-        pct = d.get("pct") if d.get("pct") is not None else d.get("drop_pct", 0)
-        link = product_link(d["key"]) if d.get("key") else (d.get("url") or "")
-        lines.append("• <b>%s</b>\n  %s L <i>(ishte %s)</i> −%s%% · %s\n  %s" %
-                     (htmlmod.escape(name[:55]), fmt_price(d.get("price")), fmt_price(old),
-                      round(float(pct or 0), 1), htmlmod.escape(d.get("store_name") or ""), link))
-    lines.append("\n🌐 " + SITE_URL)
-    msg = "\n".join(lines)
-    sent = 0
-    for chat_id in subs:
-        if tg_send(chat_id, msg):
-            sent += 1
-        time.sleep(0.5)
-    STATE["last_digest_date"] = today
-    mark_dirty()
-    return sent
-
-# ---------------------------------------------------------------- admin summary
-def admin_summary():
-    if not ADMIN_CHAT:
-        return False
-    rep = DATA["report"] or {}
-    stats = rep.get("stats", {}) or {}
-    stores = rep.get("stores", {}) or {}
-    dead = sorted([s.get("name", k) for k, s in stores.items() if not s.get("products")])
-    fails = STATE.get("store_fails", {})
-    for k, s in stores.items():
-        nm = s.get("name", k)
-        fails[nm] = fails.get(nm, 0) + 1 if not s.get("products") else 0
-    STATE["store_fails"] = {k: v for k, v in fails.items() if v > 0}
-    mark_dirty()
-    chronic = sorted([k for k, v in fails.items() if v >= 3])
-    lines = [
-        "📊 <b>ÇmimRadar — skanimi %s</b>" % rep.get("date", "?"), "",
-        "🛍️ %s produkte · %s grupe · %s dyqane" %
-        (fmt_price(stats.get("products", 0)), fmt_price(stats.get("groups", 0)),
-         stats.get("stores", len(stores))),
-        "📉 %d ulje · 📈 %d rritje" % (stats.get("drops", 0), stats.get("rises", 0)), "",
-        "🔔 Alarme TG/email aktive: %d" % len(STATE.get("subs", [])),
-        "📰 Digest abonentë: %d" % len(STATE.get("digest_subs", [])),
-    ]
-    if dead:
-        lines += ["", "⚠️ Dyqane me 0 produkte: " + ", ".join(dead[:8])]
-    if chronic:
-        lines += ["", "🚨 Bien 3+ ditë: " + ", ".join(chronic)]
-    if not dead and not chronic:
-        lines += ["", "✅ Të gjitha dyqanet skanuan normalisht."]
-    return tg_send(ADMIN_CHAT, "\n".join(lines))
-
-# ---------------------------------------------------------------- jobs
-JOB_TIMERS = {}
-
-
-def every(name, seconds):
-    now = time.time()
-    if now - JOB_TIMERS.get(name, 0) >= seconds:
-        JOB_TIMERS[name] = now
-        return True
-    return False
-
-
-def run_jobs():
-    try:
-        if every("heartbeat", HEARTBEAT_EVERY):
-            write_heartbeat()
-        if every("data", DATA_TTL):
-            refresh_data(force=True)
-        # raport i ri? → admin summary (+ digest pas skanimit të mbrëmjes)
-        if every("report_watch", REPORT_WATCH_EVERY) and refresh_data():
-            rdate = (DATA["report"] or {}).get("date", "")
-            if rdate and rdate != STATE.get("last_report_date"):
-                STATE["last_report_date"] = rdate
-                mark_dirty()
-                print("Raport i ri: %s → admin summary" % rdate, flush=True)
-                admin_summary()
-                send_daily_digest()
-        if every("prices", PRICE_CHECK_EVERY):
-            n = check_price_alerts()
-            p = check_push_alerts()
-            d = send_push_digest()
-            if n or p or d:
-                print("Alarme: tg/email=%d push=%d digest=%d" % (n, p, d), flush=True)
-        save_state()
-    except Exception:
-        print("  !! gabim në jobs:\n%s" % traceback.format_exc()[:600], flush=True)
-
 # ---------------------------------------------------------------- main loop
+# SHËNIM 2026-11-19 (bot-sync, spec §4): alarmet e çmimeve, alarmet push,
+# push digest, digest-i ditor dhe admin summary DËRGOHEN VETËM nga cron-i
+# (check_remote_alerts.py). Kopjet e fjetura që ishin këtu — run_jobs(),
+# check_price_alerts(), check_push_alerts(), send_push_digest(),
+# send_daily_digest(), admin_summary() (+ send_email, push_blobs_get/delete,
+# webpush_send) — u hoqën: në webhook mode (produksion) nuk ekzekutoheshin
+# kurrë, dhe dyfishimi ishte burim gabimesh (tekste/URL/format të ndryshëm).
+# Këtu mbetet vetëm heartbeat-i (e lexon health_check C-BOT-2).
 def run_polling():
-    """Long polling — për testim lokal."""
+    """Long polling — për testim lokal. Thërret VETËM heartbeat-in."""
     while True:
         try:
             PENDING_OPS.clear()  # në polling ruhet full-state, jo ops-e
@@ -1024,7 +1078,8 @@ def run_polling():
         except Exception:
             print("  !! gabim në poll:\n%s" % traceback.format_exc()[:600], flush=True)
             time.sleep(5)
-        run_jobs()
+        if _heartbeat_due():
+            write_heartbeat()
 
 
 # ---------------------------------------------------------------- ops (intent-tracking)
@@ -1109,7 +1164,7 @@ def run_webhook():
                     handle_update(u)
                     flush_ops()
                     # heartbeat oportunist: çdo update provon gjallërinë
-                    if every("heartbeat", HEARTBEAT_EVERY):
+                    if _heartbeat_due():
                         write_heartbeat()
             except Exception:
                 print("  !! gabim në webhook:\n%s" % traceback.format_exc()[:400], flush=True)
@@ -1157,7 +1212,7 @@ def run_webhook():
 
 
 def main():
-    print("ÇmimRadar Bot worker u nis.", flush=True)
+    print("RADAR Bot worker u nis.", flush=True)
     load_state()
     refresh_data(force=True)
     me = tg("getMe", {})
@@ -1169,7 +1224,7 @@ def main():
         run_webhook()
     else:
         if ADMIN_CHAT:
-            tg_send(ADMIN_CHAT, "🤖 <b>ÇmimRadar Bot u ndez.</b>\nPërgjigjet në sekonda. ✅")
+            tg_send(ADMIN_CHAT, "🤖 <b>RADAR Bot u ndez.</b>\nPërgjigjet në sekonda. ✅")
         run_polling()
 
 

@@ -6,11 +6,6 @@ Lexon të dhënat live nga https://cmimradar.netlify.app/data/*.json
 (`products.json`, `report.json`, `history.json`).
 State-i mbahet në Netlify Blobs via function-i `bot-state`.
 
-> **Shënim 2026-11-19 (bot-sync, Hapat 2–6):** kopja lokale e këtij
-> direktoriumi **ka diverguar nga repo HEAD** (`ErionNezha/cmimradar-bot`)
-> me qëllim — ndryshimet janë lokale derisa përdoruesi të miratojë
-> checklist-in e deploy-it. **Mos bëj commit / push / deploy.**
-
 ## File-t
 
 | File | Çfarë është |
@@ -69,15 +64,15 @@ python3 -m py_compile bot_worker.py radar_logic.py
 
 # 2. Verifikimi i plotë offline (pa rrjet, pa token, pa mesazhe live)
 python3 ~/workspace/radar-verify/test_bot_worker.py
-# -> 109 checks; pritet 107 PASS + 2 FAIL të dokumentuara
-#    (kërkimet "iphone 17" / "ajfon" — shih shënimin më poshtë)
+# -> 111 checks; pritet 107 PASS + 4 FAIL të dokumentuara
+#    (2 ranking "iphone 17" / "ajfon" + alias REDMI + Pro Max BLI TANI -> FLAT — shih shënimin më poshtë)
 ```
 
 Testi vendos `TG_BOT_TOKEN` / `BOT_KEY` fallco, i lexon të dhënat reale
 lokale (`~/workspace/cmimradar-site/data/*.json`) dhe i kap mesazhet
 dalëse në vend që t'i dërgojë.
 
-**2 FAIL të njohura (të qëllimshme, jo bug-e të kodit):** renditja
+**4 FAIL të njohura (të qëllimshme, jo bug-e të kodit):** renditja
 kanonike (përputhje kategorie → fillim titulli → çmimi më i lirë) e
 kërkimit `iphone 17` jep `iPhone 17 — 256 GB esim` 66.721 L dhe e
 `ajfon` jep `iPhone X` 7.500 L — jo `iPhone 17 Pro Max` 82.900 L siç
@@ -87,6 +82,9 @@ me implementimin e referencës). Pro Max-i nuk është më i liri; ta
 nxjerrësh të parin do të kërkonte një rregull shtesë (p.sh. barazim
 → më shumë dyqane së pari) që spec-i nuk e përmban. Vendimi i mbetet
 koordinatorit — shih `~/workspace/radar-verify/bot-sync-notes-B.md`.
+Dy FAIL-et e tjera: alias REDMI (artefakt i të dhënave të 19 nëntorit)
+dhe Pro Max BLI TANI → FLAT (histori e sheshtë = "Çmim i qëndrueshëm",
+sjellja e synuar e fix-it FLAT).
 
 ## Testimi live (i bllokuar)
 
@@ -98,3 +96,13 @@ deploy-it (bot-sync). Mos e testo kurrë me botin e prodhimit.
 
 `TG_BOT_TOKEN`, `BOT_KEY`, `TG_ADMIN_CHAT`, `SITE_URL`
 (opsionale; default `https://cmimradar.netlify.app`).
+
+## Webhook-u i prodhimit — KUJDES
+
+Statusi i webhook-ut të prodhimit (`@cmimradarbot`) kontrollohet
+**VETËM** me `check_webhook_health.py`
+(`~/workspace/cmimradar-pilot/check_webhook_health.py`), i cili e lexon
+token-in e prodhimit nga goal-i i ÇmimRadar-it. **Kurrë përmes
+connector-it `custom.telegram-bot-api`** — ai mban token-in e botit të
+testit (`rada1r_bot`) dhe `getWebhookInfo` përmes tij kthen `url: ""`
+(gjendja e testit, jo e prodhimit).

@@ -156,6 +156,109 @@ SMARTPHONE_WORDS = {"galaxy", "redmi", "iphone", "pixel", "poco", "honor",
                     "huawei", "itel", "tcl", "zte", "alcatel"}
 
 
+# Variant-signature rule (2026-11-22, audit item 4): "iphone 17" ≠ "17 Air"
+# ≠ "17 Pro" ≠ "17 Pro Max" ≠ "17e". Port of the site build.py MODIFIERS
+# (build.py:605-607) + variant_sig() (build.py:656), adapted for QUERY
+# matching: connectivity tokens (4g/5g/3g/cellular) and audio tokens
+# (anc/nc) are NOT model variants a shopper distinguishes — including them
+# would drop e.g. "Galaxy S25 5G" for the query "galaxy s25" — so the
+# query-matching set keeps only the model-variant words. "cellular" is
+# excluded for the same reason AND because it is a store prefix
+# ("CELULAR iPhone 17 ...") that must never enter a variant signature.
+VARIANT_TOKENS = {"ultra", "pro", "proplus", "max", "plus", "lite", "fe",
+                  "mini", "note", "fold", "flip", "xl", "xs", "air", "edge",
+                  "slim", "neo", "se"}
+_VARIANT_SUFFIX = ("air", "pro", "proplus", "max", "plus", "ultra", "mini",
+                   "lite", "fe", "se", "edge", "slim", "fold", "flip", "note",
+                   "xl", "xs", "neo")
+_STORAGE_RE = re.compile(r"^\d+(gb|tb|mb)$")
+_CONNECTIVITY = {"4g", "5g", "3g", "lte", "cellular"}
+
+
+def _variant_sig(tokens):
+    """Canonical variant signature of a token list (query core or group
+    title). {} for a base model ("iphone 17"), {"air"} for "17 Air",
+    {"pro", "max"} for "17 Pro Max", {"17e"} for "17e". Connectivity
+    (5g/cellular), storage (256gb) and colours never enter the signature.
+    Fused tokens are split: "s25plus" -> "plus", "17pro" -> "pro"; a fused
+    model suffix ("17e", "s10e", "a52s") is kept whole, so "17e" still
+    differs from "17" — while spec tokens glued to a number ("4k",
+    "65w", "120hz", "48mp") never enter the signature (see below).
+    """
+    sig = set()
+    for t in tokens or []:
+        if t in VARIANT_TOKENS:
+            sig.add(t)
+            continue
+        if t in _CONNECTIVITY or _STORAGE_RE.match(t):
+            continue
+        m = re.match(r"^([a-z]*)(\d+)([a-z]+)$", t)
+        if m:
+            suf = m.group(3)
+            if suf in _VARIANT_SUFFIX:
+                sig.add(suf)
+            elif (len(suf) == 1 and suf in ("e", "s", "c")
+                    and len(m.group(2)) >= 2):
+                # Model suffix glued to its number: "17e" ≠ "17", "a52s" ≠
+                # "a52", "s10e" ≠ "s10". Anything else glued to a number
+                # is a spec, not a variant — "4k" (resolution), "65w"
+                # (power), "120hz" (refresh), "48mp" (camera), "10000mah"
+                # (battery), "120mm" (size) must NEVER enter the signature
+                # (verified over live 2026-11-22 titles: thousands of such
+                # tokens; a single-letter suffix other than e/s/c, or a
+                # 1-digit number ("6e" = Wi-Fi 6E), is a spec too).
+                sig.add(t)
+    return frozenset(sig)
+
+
+def _has_model_token(tokens):
+    """True when the query names a specific model: a required number
+    ("17", "55") or an alphanumeric model token ("s25", "a55", "17e").
+    Storage ("256gb") and connectivity ("5g") never count. Without a
+    model token ("macbook", "iphone", "laptop") the variant rule does not
+    apply — a bare brand/line query must not lose e.g. MacBook Air."""
+    for t in tokens or []:
+        if _STORAGE_RE.match(t) or t in _CONNECTIVITY:
+            continue
+        if t.isdigit() or (re.search(r"\d", t)
+                           and re.match(r"^[a-z0-9]+$", t)):
+            return True
+    return False
+
+
+def _accessory_led(core):
+    """True when the query's first core token is an accessory word
+    ("kase për iphone 17 air"): the query is about the accessory, not
+    the device — the variant rule must not touch it."""
+    if not core:
+        return False
+    return any(core[0].startswith(m) for m in ACCESSORY_MARKERS)
+
+
+def _variant_context(query, budget, core):
+    """(apply, query_sig) for the variant-signature rule.
+
+    Applies only when the query names a device class (deviceQuery) AND a
+    specific model (a number / model token) AND is not accessory-led.
+    The caller compares the candidate GROUP TITLE's signature to
+    query_sig — never the haystack (offer titles carry accessories of
+    other variants).
+    """
+    if not any(c in DEVICE_CORES for c in core) or _accessory_led(core):
+        return False, frozenset()
+    q_toks = strip_budget_tokens(query, budget).split()
+    if not _has_model_token(q_toks):
+        return False, frozenset()
+    return True, _variant_sig(q_toks)
+
+
+def _variant_ok(title, query_sig, apply):
+    """Variant-signature equality on the GROUP TITLE tokens."""
+    if not apply:
+        return True
+    return _variant_sig(norm(title).split()) == query_sig
+
+
 # Faza 1 (2026-11-20, audit §13.3/#1c): trajta e shquar → trajta e
 # pashquar, para TË GJITHA kontrolleve (deviceQuery, CATMAP, "laptop" in
 # core, laptop-spec). "laptopi" s'është në DEVICE_CORES/CATMAP — pa këtë
@@ -354,12 +457,34 @@ def _relevance(g, core):
     dev = [t for t in core if t not in STOPWORDS]
     if dev:
         first = SYN.get(dev[0], {dev[0]})
-        if title_toks and title_toks[0] in first:
-            score += 2
-        if len(dev) > 1 and len(title_toks) > 1:
-            second = SYN.get(dev[1], {dev[1]}) if not dev[1].isdigit() else {dev[1]}
-            if title_toks[1] in second:
-                score += 1
+        # Store/brand-prefixed titles ("CELULAR iPhone 17 ...", "Apple
+        # iPhone 17 ..."): the device word
+        # is not token[0] but token[1]/[2] — the +2 bonus (and the +1 for
+        # the following token) are measured from where the device word
+        # actually sits, within the first 3 tokens (same window as
+        # _device_filter). Without a prefix the offset is 0: unchanged.
+        idx = next((i for i, t in enumerate(title_toks[:3]) if t in first),
+                   None)
+        if idx is not None:
+            if len(dev) > 1:
+                second = (SYN.get(dev[1], {dev[1]})
+                          if not dev[1].isdigit() else {dev[1]})
+            else:
+                second = set()
+            # The offset bonus is real only when the token after the
+            # device word confirms the same model: dev[1] ("Galaxy" after
+            # "Samsung") or a number — the model number itself, which
+            # search_groups keeps out of `core` ("17" after "iPhone" in
+            # "CELULAR iPhone 17 ..."). Otherwise a buried device word
+            # ("Sony PS5 Persona", "Apple iPhone Leather Wallet", "Koke
+            # karikimi iPhone") would outrank the device itself.
+            confirmed = (idx == 0 or (len(title_toks) > idx + 1
+                                      and (title_toks[idx + 1] in second
+                                           or title_toks[idx + 1].isdigit())))
+            if confirmed:
+                score += 2
+                if len(dev) > 1 and title_toks[idx + 1] in second:
+                    score += 1
     # console queries: hardware beats games (same cat/pcat for both)
     if any(c in ("ps5", "ps4", "xbox", "switch", "nintendo", "playstation")
            for c in core):
@@ -414,9 +539,12 @@ def search_ranked(groups, query, aliases=None, limit=5):
     """
     hits, _budget, core = search_groups(groups, query, aliases)
     device_query = any(c in DEVICE_CORES for c in core)
+    apply_variant, q_sig = _variant_context(query, _budget, core)
     ranked = []
     for g in hits:
         if device_query and not _device_filter(g, core):
+            continue
+        if not _variant_ok(g.get("title", ""), q_sig, apply_variant):
             continue
         if not _smartphone_ok(g, core, query):
             continue
@@ -753,9 +881,12 @@ def answer_ai(groups, query, aliases=None, fx=None, fx_date=None):
     budget_eur = eur_amount(query)
     fx_used = fx if (budget_eur is not None and fx and fx > 0) else None
     device_query = any(c in DEVICE_CORES for c in core)
+    apply_variant, q_sig = _variant_context(query, budget, core)
     ranked = []
     for g in hits:
         if device_query and not _device_filter(g, core):
+            continue
+        if not _variant_ok(g.get("title", ""), q_sig, apply_variant):
             continue
         if not _smartphone_ok(g, core, query):
             continue
@@ -779,6 +910,8 @@ def answer_ai(groups, query, aliases=None, fx=None, fx_date=None):
         allr = []
         for g in hits:
             if device_query and not _device_filter(g, core):
+                continue
+            if not _variant_ok(g.get("title", ""), q_sig, apply_variant):
                 continue
             if not _smartphone_ok(g, core, query):
                 continue

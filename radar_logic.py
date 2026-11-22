@@ -96,6 +96,10 @@ STOPWORDS = {
     # Vetëm fjalë-pyetje; fjalët kohore/njoftuese (muajin/kaluar/njofto/bie)
     # NUK hiqen këtu — ato i përkasin intent-eve të Fazës 3 (jo në scope).
     "sa", "kushton", "kushtonte", "cilin", "cilen", "pse", "si", "cfare",
+    # FINAL FIX PASS §6 (2026-11-22): "stok" është filtër, jo term kërkimi
+    # (si te faqja: AI_STOP) — përndryshe "iphone 17 më i liri në stok"
+    # kërkon fjalën "stok" në tituj dhe kthen ZERO rezultate.
+    "stok", "stokun", "stokut", "stock",
 }
 # Back-compat alias (the reference file calls this STOP).
 STOP = STOPWORDS
@@ -144,7 +148,12 @@ ACCESSORY_MARKERS = {
 
 DEVICE_CORES = {"tv", "televizor", "laptop", "telefon", "celular", "iphone",
                 "ajfon", "ps5", "playstation", "samsung", "fshese", "fshesa",
-                "aspirator"}
+                "aspirator",
+                # FINAL FIX PASS §6 (2026-11-22): si AI_DEVCORES te faqja —
+                # pa 'frigorifer' filtri i pajisjes/aksesorëve nuk zbatohej
+                # dhe "frigorifer deri 1000 L" përgjigjej me aksesorë
+                # (bllokues sigurie, filtër BRITA) në vend të frigoriferit.
+                "frigorifer", "frigoriferi", "fridge", "refrigerator"}
 
 LAPTOP_SPEC = {"ram", "intel", "amd", "core", "celeron", "ryzen", "ssd",
                "hdd", "emmc", "ghz", "kryo", "snapdragon", "mediatek",
@@ -540,6 +549,7 @@ def search_ranked(groups, query, aliases=None, limit=5):
     hits, _budget, core = search_groups(groups, query, aliases)
     device_query = any(c in DEVICE_CORES for c in core)
     apply_variant, q_sig = _variant_context(query, _budget, core)
+    want_in_stock = _wants_in_stock(query)
     ranked = []
     for g in hits:
         if device_query and not _device_filter(g, core):
@@ -548,7 +558,7 @@ def search_ranked(groups, query, aliases=None, limit=5):
             continue
         if not _smartphone_ok(g, core, query):
             continue
-        c = cheapest_valid(g)
+        c = _lead_offer(g, want_in_stock)
         if not c:
             continue
         ranked.append((-_relevance(g, core), c["price"], g, c))
@@ -572,6 +582,18 @@ def is_used(offer, gtitle=""):
 def is_vitrine(offer, gtitle=""):
     for raw in ((offer or {}).get("title", ""), gtitle):
         if "VITRIN" in (raw or "").upper():
+            return True
+    return False
+
+
+def is_no_box(offer, gtitle=""):
+    """Mirror site isNoBox (index.html): data flag OR title patterns."""
+    if (offer or {}).get("is_no_box"):
+        return True
+    for raw in ((offer or {}).get("title", ""), gtitle):
+        u = (raw or "").upper()
+        if ("NO BOX" in u or "NO-BOX" in u or "NOBOX" in u
+                or "PA KUTI" in u):
             return True
     return False
 
@@ -603,27 +625,81 @@ def comparable_offers(group):
             continue
         if is_suspicious(o, med):
             continue
+        # FINAL FIX PASS §6 (2026-11-22): "çmim nga" (price_from) nuk është
+        # kurrë "më i liri" — si te faqja (FINAL POLISH: 221 oferta
+        # price_from të përjashtuara nga best/drops/verdicts). Pa këtë,
+        # "iphone 17 më i liri në stok" kryesohej nga një ofertë "nga"
+        # (73.500 L) në vend të çmimit real në stok (74.900 L, Tigo).
+        if o.get("price_from"):
+            continue
+        # FINAL FIX PASS §6 (2026-11-22): ofertat e flamuruara
+        # is_unverified_variant (p.sh. të gjitha iPhone-t e Celular-it)
+        # nuk janë kurrë "më i liri" — si te faqja (build.py: oferta e
+        # flamuruar përjashtohet nga best/verdicts). Pa këtë, "iphone 17
+        # më i liri" kryesohej nga Celular 71.146 L (in_stock=None) në
+        # vend të çmimit real (74.900 L, Tigo). Zbuluar në rishikim para
+        # deploy-it të bot-it; commit-i 1e898a8 e premtonte por s'e
+        # zbatonte dot (asnjë referencë is_unverified_variant në kod).
+        if o.get("is_unverified_variant"):
+            continue
+        # Site rule (index.html comparableOffers, linja 711): "Pa kuti"
+        # nuk është kurrë "më i liri" — pa këtë, "iphone 17 pro max"
+        # kryesohej nga German Computers 97.900 L (NEW NO BOX E-SIM)
+        # në vend të 112.900 L (3V Fejzo, Fizik).
+        if is_no_box(o, gtitle):
+            continue
         out.append(o)
     return out
 
 
 def cheapest_valid(group):
     """Lowest-price comparable offer with in_stock is not False
-    (True or None allowed)."""
+    (True or None allowed). Mirror site cheapest(): prefer a NON-eSIM
+    offer when one exists (an eSIM offer leads only if it is the only
+    comparable one — e.g. American 112.000 USA e-SIM never beats
+    3V Fejzo 112.900 Fizik for Pro Max)."""
     valid = [o for o in comparable_offers(group)
              if o.get("in_stock") is not False]
+    plain = [o for o in valid if not o.get("is_esim")]
+    if plain:
+        valid = plain
     if not valid:
         return None
     return min(valid, key=lambda o: o["price"])
 
 
 def cheapest_in_stock(group):
-    """Lowest-price comparable offer with in_stock is True (None if none)."""
+    """Lowest-price comparable offer with in_stock is True (None if none).
+    Mirror site cheapestInStock(): prefer NON-eSIM when one exists."""
     valid = [o for o in comparable_offers(group)
              if o.get("in_stock") is True]
+    plain = [o for o in valid if not o.get("is_esim")]
+    if plain:
+        valid = plain
     if not valid:
         return None
     return min(valid, key=lambda o: o["price"])
+
+
+def _wants_in_stock(query):
+    """FINAL FIX PASS §6 (2026-11-22): True when the question asks for
+    confirmed stock — "në stok" / "me stok" / "stokun" / "in stock".
+    norm() folds ë->e, so "në" is "ne" and "stok" matches "stokun"."""
+    return bool(re.search(r"\b(stok\w*|in stock)\b", norm(query or "")))
+
+
+def _lead_offer(group, want_in_stock):
+    """The offer that LEADS an answer for a group.
+
+    want_in_stock (question asks "në stok") -> cheapest offer with
+    in_stock is True; a group with no confirmed-stock offer has NO lead
+    (caller skips it — it must never answer as "më i liri në stok" with
+    an unconfirmed Celular offer). Otherwise -> cheapest_valid, the
+    documented behaviour (cheapest overall + "stoku i pakonfirmuar" label
+    when its stock is unconfirmed)."""
+    if want_in_stock:
+        return cheapest_in_stock(group)
+    return cheapest_valid(group)
 
 
 def canonical_cheapest(group):
@@ -874,6 +950,9 @@ def answer_ai(groups, query, aliases=None, fx=None, fx_date=None):
     budget, `fallback` is the cheapest REAL device of that category (same
     filters, no budget cap); when there is nothing at all, `fallback` is
     None and `no_match` is True. Accessories are never shown as devices.
+    §6 (2026-11-22): when the question asks "në stok", the lead offer is
+    the cheapest with CONFIRMED stock (cheapest_in_stock); a group with
+    no confirmed-stock offer is skipped entirely for that question.
     `fx` = kursi EUR→LEK (report.json: fx.EUR_ALL); `fx_date` = data e tij.
     """
     lang = detect_lang(query)
@@ -882,6 +961,7 @@ def answer_ai(groups, query, aliases=None, fx=None, fx_date=None):
     fx_used = fx if (budget_eur is not None and fx and fx > 0) else None
     device_query = any(c in DEVICE_CORES for c in core)
     apply_variant, q_sig = _variant_context(query, budget, core)
+    want_in_stock = _wants_in_stock(query)
     ranked = []
     for g in hits:
         if device_query and not _device_filter(g, core):
@@ -890,7 +970,7 @@ def answer_ai(groups, query, aliases=None, fx=None, fx_date=None):
             continue
         if not _smartphone_ok(g, core, query):
             continue
-        c = cheapest_valid(g)
+        c = _lead_offer(g, want_in_stock)
         if not c:
             continue
         if budget and c["price"] > budget:
@@ -915,7 +995,7 @@ def answer_ai(groups, query, aliases=None, fx=None, fx_date=None):
                 continue
             if not _smartphone_ok(g, core, query):
                 continue
-            c = cheapest_valid(g)
+            c = _lead_offer(g, want_in_stock)
             if c:
                 allr.append((c["price"], g, c))
         allr.sort(key=lambda x: x[0])

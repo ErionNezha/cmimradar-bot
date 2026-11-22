@@ -625,7 +625,10 @@ def handle_ai(chat_id, query):
         for i, p in enumerate(picks, 1):
             g, offer = p["group"], p["offer"]
             stock = ""
-            if offer.get("in_stock") is None:
+            if offer.get("in_stock") is True:
+                stock = (" · në stok" if lang == "sq"
+                         else " · in stock")
+            elif offer.get("in_stock") is None:
                 stock = (" · stoku i pakonfirmuar" if lang == "sq"
                          else " · stock unconfirmed")
             label, _reason = _verdict_for_group(g, offer["price"])
@@ -648,20 +651,28 @@ def handle_ai(chat_id, query):
         g, offer = fb["group"], fb["offer"]
         btxt = (_budget_line(res, lang)
                 or (("%s L" % fmt_price(budget)) if budget else "—"))
+        # §6: same stock text as the picks (confirmed stock is named, too)
+        if offer.get("in_stock") is True:
+            stock = (" · në stok" if lang == "sq" else " · in stock")
+        elif offer.get("in_stock") is None:
+            stock = (" · stoku i pakonfirmuar" if lang == "sq"
+                     else " · stock unconfirmed")
+        else:
+            stock = ""
         if lang == "en":
             text = ("Nothing under <b>%s</b> — the cheapest real option is:\n\n"
-                    "<b>%s</b>\n💰 <b>%s L</b> at <b>%s</b>\n"
+                    "<b>%s</b>\n💰 <b>%s L</b> at <b>%s</b>%s\n"
                     '🔗 <a href="%s">View</a>' %
                     (btxt,
                      trunc_word(g.get("title", ""), 90), fmt_price(offer["price"]),
-                     offer.get("store_name", ""), radar_logic.product_url(g)))
+                     offer.get("store_name", ""), stock, radar_logic.product_url(g)))
         else:
             text = ("Nuk gjeta asgjë nën <b>%s</b>. Më i liri real është:\n\n"
-                    "<b>%s</b>\n💰 <b>%s L</b> te <b>%s</b>\n"
+                    "<b>%s</b>\n💰 <b>%s L</b> te <b>%s</b>%s\n"
                     '🔗 <a href="%s">Shiko</a>' %
                     (btxt,
                      trunc_word(g.get("title", ""), 90), fmt_price(offer["price"]),
-                     offer.get("store_name", ""), radar_logic.product_url(g)))
+                     offer.get("store_name", ""), stock, radar_logic.product_url(g)))
         tg_send(chat_id, text, preview=True)
         return
     if lang == "en":

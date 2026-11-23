@@ -598,6 +598,24 @@ def is_no_box(offer, gtitle=""):
     return False
 
 
+def is_usa(offer, gtitle=""):
+    """US-carrier version (2026-11-23, Item 1): mirror site isUsaOffer
+    (index.html) and the data flag is_usa (build.py) — data flag OR
+    raw-title carrier markers (AT&T / T-Mobile / Verizon / Straight
+    Talk / USA / SHBA). Same rule as eSIM/unverified: a USA offer is
+    never the lead when a plain EU offer exists. The data-side fallback
+    (scanner_cheapest trusting rebuilt data `best`) still answers
+    USA/eSIM-only groups; the pure path simply yields no USA lead."""
+    if (offer or {}).get("is_usa"):
+        return True
+    for raw in ((offer or {}).get("title", ""), gtitle):
+        if re.search(r"AT&T|T-Mobile|Verizon|Straight[ -]?Talk|\bUSA\b|"
+                     r"US version|Unlocked USA|\bSHBA\b",
+                     raw or "", re.IGNORECASE):
+            return True
+    return False
+
+
 def group_median(group):
     prices = [o["price"] for o in (group or {}).get("offers", [])
               if o.get("price")]
@@ -648,6 +666,13 @@ def comparable_offers(group):
         # në vend të 112.900 L (3V Fejzo, Fizik).
         if is_no_box(o, gtitle):
             continue
+        # US-carrier versions (2026-11-23, Item 1): AT&T / T-Mobile /
+        # Verizon / Straight Talk / USA / SHBA — never the lead when a
+        # plain EU offer exists (same rule as eSIM/unverified). This
+        # single point fixes cheapest_valid / cheapest_in_stock /
+        # _lead_offer / canonical_cheapest (all consume this function).
+        if is_usa(o, gtitle):
+            continue
         out.append(o)
     return out
 
@@ -656,8 +681,9 @@ def cheapest_valid(group):
     """Lowest-price comparable offer with in_stock is not False
     (True or None allowed). Mirror site cheapest(): prefer a NON-eSIM
     offer when one exists (an eSIM offer leads only if it is the only
-    comparable one — e.g. American 112.000 USA e-SIM never beats
-    3V Fejzo 112.900 Fizik for Pro Max)."""
+    comparable one). USA offers are excluded outright by
+    comparable_offers() (Item 1, 2026-11-23) — e.g. Pro Max leads with
+    shpresa 114.990, never the AT&T 112.900 or the USA e-SIM 112.000."""
     valid = [o for o in comparable_offers(group)
              if o.get("in_stock") is not False]
     plain = [o for o in valid if not o.get("is_esim")]
@@ -670,7 +696,8 @@ def cheapest_valid(group):
 
 def cheapest_in_stock(group):
     """Lowest-price comparable offer with in_stock is True (None if none).
-    Mirror site cheapestInStock(): prefer NON-eSIM when one exists."""
+    Mirror site cheapestInStock(): prefer NON-eSIM when one exists.
+    USA offers are excluded outright by comparable_offers()."""
     valid = [o for o in comparable_offers(group)
              if o.get("in_stock") is True]
     plain = [o for o in valid if not o.get("is_esim")]

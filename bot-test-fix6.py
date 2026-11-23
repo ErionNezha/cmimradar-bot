@@ -2,12 +2,21 @@
 Loads radar_logic from the canonical repo, downloads FRESH live
 products.json, runs the key queries and asserts the expected lead offer.
 Usage: python3 bot-test-fix6.py [products.json path] [radar_logic.py path]
+       [history.json path]
 Defaults: fresh download from cmimradar.netlify.app; ~/workspace/cmimradar-bot/radar_logic.py
 Exit 0 = all pass, 1 = any fail.
+
+Item 6 (2026-11-23) — verdict rule: FLAT when the price range over the
+FULL available history is < 3%; BLI TANI only when current <= min(last 30)
+AND current <= 0.95 * median(last 30); family cap (BLI TANI -> PRIT when
+current >= 1.10 * family_best_in_stock). Verdict assertions below use the
+same history.json the bot loads; lead assertions are unchanged (zero
+regressions allowed on leads/prices).
 """
 import importlib.util, json, os, subprocess, sys
 
 PROD_URL = "https://cmimradar.netlify.app/data/products.json"
+HIST_URL = "https://cmimradar.netlify.app/data/history.json"
 REPO = os.path.expanduser("~/workspace/cmimradar-bot/radar_logic.py")
 
 def load(name, path):
@@ -20,8 +29,14 @@ prod_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/bot-test-products.json"
 if len(sys.argv) <= 1:
     subprocess.run(["curl", "-sS", "--max-time", "60", PROD_URL,
                     "-o", prod_path], check=True)
+hist_path = sys.argv[3] if len(sys.argv) > 3 else "/tmp/bot-test-history.json"
+if len(sys.argv) <= 3:
+    subprocess.run(["curl", "-sS", "--max-time", "60", HIST_URL,
+                    "-o", hist_path], check=True)
 rl = load("rl_fixed", sys.argv[2] if len(sys.argv) > 2 else REPO)
 prods = json.load(open(prod_path, encoding="utf-8"))
+hist = json.load(open(hist_path, encoding="utf-8"))
+hgroups = hist.get("groups", {})
 merged, _ = rl.merge_groups(prods["groups"])
 print(f"groups: {len(merged)} date: {prods.get('date')}")
 
@@ -42,8 +57,8 @@ CASES = [
     # now the cheapest plain EU in-stock offer, shpresa 114990.
     ("iphone 17 pro max", "shpresa", 114990, "Pro Max lead (AT&T 112900 + USA e-SIM 112000 excluded)"),
     ("iphone 17 pro max më i liri në stok", "shpresa", 114990, "Pro Max in-stock"),
-    ("iphone 17 pro max 512gb", "molla", 170335, "Pro Max 512GB (AT&T 117900 excluded)"),
-    ("iphone 17 pro max 1tb", "molla", 193779, "Pro Max 1TB (AT&T 147900 excluded)"),
+    ("iphone 17 pro max 512gb", "neptun", 164999, "Pro Max 512GB (AT&T 117900 excluded; lead moved molla 170335 -> neptun 164999 in the 2026-11-23 morning scan — data change, not a code regression)"),
+    ("iphone 17 pro max 1tb", "molla", 193099, "Pro Max 1TB (AT&T 147900 excluded; price moved 193779 -> 193099 in the 2026-11-23 morning scan — data change)"),
     # 17e: lead STAYS tigo 52500 E-SIM — legitimate fallback, its only
     # plain offer (shpresa 57990) is OUT OF STOCK. Asserted as eSIM
     # below, not as a different lead.
@@ -69,11 +84,12 @@ for q, exp_store, exp_price, note in CASES:
     fails += 0 if ok else 1
 
 # s26 ultra: preorder — KNOWN OPEN item (bot answers Celular preorder,
-# site says none). Lead must stay celular 73851 until preorder handling
-# is decided separately.
+# site says none). Lead must stay celular 73592 until preorder handling
+# is decided separately. (Price moved 73851 -> 73592 in the 2026-11-23
+# morning scan — data change, not a code regression.)
 store, price, _ = lead("samsung s26 ultra")
-ok = (store, price) == ("celular", 73851)
-print(("PASS " if ok else "FAIL ") + f"'samsung s26 ultra': lead={store} {price} (pritet celular 73851 — preorder, item i hapur)")
+ok = (store, price) == ("celular", 73592)
+print(("PASS " if ok else "FAIL ") + f"'samsung s26 ultra': lead={store} {price} (pritet celular 73592 — preorder, item i hapur)")
 fails += 0 if ok else 1
 
 # 17e: the lead must be the eSIM offer AND flagged as such (fallback rule)
@@ -84,16 +100,19 @@ print(("PASS " if ok else "FAIL ") + f"'iphone 17e' lead flagged eSIM: {p17.get(
 fails += 0 if ok else 1
 
 # Direct comparable_offers() assertions on the Pro Max group.
-# Group key changed in the 2026-11-23 rebuild (merge of the Globe
-# duplicates re-keyed it): new 51e459b347fb2104, old 60acb9d66949bd76
-# (still resolvable via products.json aliases). Try the new key first.
+# Group key changed AGAIN in the 2026-11-23 morning scan (merge/re-key):
+# new d2b6939034cc8f00; previous 51e459b347fb2104 (resolvable via
+# products.json aliases) and 60acb9d66949bd76. Try the new key first.
 pm_group = next((g for g in merged if g.get("key") in
-                 ("51e459b347fb2104", "60acb9d66949bd76")), None)
+                 ("d2b6939034cc8f00", "51e459b347fb2104",
+                  "60acb9d66949bd76")), None)
 if pm_group is None:
     pm_group = next((g for g in prods["groups"] if g.get("key") in
-                     ("51e459b347fb2104", "60acb9d66949bd76")), None)
+                     ("d2b6939034cc8f00", "51e459b347fb2104",
+                      "60acb9d66949bd76")), None)
 if pm_group is None:
-    print("FAIL comparable_offers: Pro Max group (51e459b347fb2104 / 60acb9d66949bd76) not found")
+    print("FAIL comparable_offers: Pro Max group (d2b6939034cc8f00 / "
+          "51e459b347fb2104 / 60acb9d66949bd76) not found")
     fails += 1
 else:
     comp = rl.comparable_offers(pm_group)
@@ -112,6 +131,44 @@ else:
     fails += 0 if ok else 1
     ok = all(not rl.is_usa(o) for o in comp)
     print(("PASS " if ok else "FAIL ") + "comparable_offers Pro Max: zero USA offers remain")
+    fails += 0 if ok else 1
+
+# Verdict rule, item 6 (2026-11-23): FLAT when the price range over the
+# FULL available history is < 3%; BLI TANI only when current <= min(last
+# 30) AND current <= 0.95 * median(last 30); family cap. The verdict is
+# computed with the group's cheapest VALID price as `current` and its
+# family_best_in_stock — exactly what bot_worker._verdict_for_group
+# passes. The scanner field in products.json still carries the OLD rule
+# (it refreshes at the next scan); these assertions pin the BOT rule.
+# (key, expected_verdict, note)
+VERDICT_CASES = [
+    ("01236525b960d5ff", "FLAT",
+     "iPhone 17 256GB: 53 pts 74.000-74.900, spread 1.22% < 3% -> FLAT, "
+     "never BLI TANI (scanner field still says BLI TANI, old rule)"),
+    ("d2b6939034cc8f00", "PRIT",
+     "iPhone 17 Pro Max 256GB: 114.990 > min30 110.900 -> PRIT"),
+    ("b2f17ae3ab6640c2", "PRIT",
+     "iPhone 17 Pro 256GB: 96.900 = min30 but 0% under med30 -> PRIT, "
+     "not BLI TANI (old site table said BLI TANI)"),
+    ("426f7d2561bd0ca1", "PRIT",
+     "iPhone 18 Pro Max 256GB: 134.900 = min30 but only 2.9% under "
+     "med30 138.990 -> PRIT, not BLI TANI (old site table said BLI TANI)"),
+]
+for key, exp, note in VERDICT_CASES:
+    g = next((x for x in merged if x.get("key") == key), None)
+    if g is None:
+        g = next((x for x in prods["groups"] if x.get("key") == key), None)
+    if g is None:
+        print(f"FAIL verdict {key}: group not found — {note}")
+        fails += 1
+        continue
+    h = (hgroups.get(key) or {}).get("history", []) or []
+    cv = rl.cheapest_valid(g)
+    got = rl.verdict_for(h, current=cv["price"] if cv else None,
+                         family_best=g.get("family_best_in_stock"))
+    ok = got == exp
+    print(("PASS " if ok else "FAIL ")
+          + f"verdict {g.get('title', key)[:40]}: {got} (pritet {exp}) — {note}")
     fails += 0 if ok else 1
 
 # frigorifer: no fridge under 1000 L — answer comes via FALLBACK, not picks

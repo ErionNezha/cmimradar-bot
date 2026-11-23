@@ -31,12 +31,19 @@ Documented approximations / deviations (do not "fix" silently):
   The reference norm() would over-merge to 19.359 (it also merges titles
   that differ only by punctuation, e.g. "Nintendo Switch - OLED" with
   "Nintendo Switch Oled"). See _merge_key_norm().
-- verdict_for(history, current=None): the spec §6 signature is
-  verdict_for(history); the optional `current` lets the caller pass the
-  group's cheapest VALID price (spec §2.3: the verdict rests on the
-  cheapest valid price, not on the last history point). With current=None
-  it uses the last history price, exactly as the website does when the
-  history's last point IS the current price.
+- verdict_for(history, current=None, family_best=None): the spec §6
+  signature is verdict_for(history); the optional `current` lets the
+  caller pass the group's cheapest VALID price (spec §2.3: the verdict
+  rests on the cheapest valid price, not on the last history point).
+  With current=None it uses the last history price, exactly as the
+  website does when the history's last point IS the current price.
+  The optional `family_best` is group["family_best_in_stock"]
+  (build.py): BLI TANI -> PRIT when current >= 1.10 * family_best
+  from a different group (site rule, 2026-11-23 item 2). Rule
+  (2026-11-23, item 6): FLAT when the price range over the FULL
+  available history is < 3%; BLI TANI only when current <= min(last 30)
+  AND current <= 0.95 * median(last 30); chg7 >= +8% -> SHMANG;
+  else PRIT.
 - answer_ai() applies the laptop-spec rule to the PICKS as well as to the
   honest fallback (spec §2.5 says explicitly "applies to the picks AND to
   the honest fallback"; the reference file applies it only to the fallback).
@@ -777,24 +784,43 @@ def scanner_verdict(group):
 
 
 # ---------------------------------------------------------------- verdict / discount
-def verdict_for(history, current=None):
+def verdict_for(history, current=None, family_best=None):
     """Verdict from history only. history = [[date, price], ...].
 
-    Needs >= 2 entries, else None. chg7 = change vs the price 7 days ago
-    (or the first entry if fewer than 8 points). FLAT history
-    (max == min, the price never moved) -> "FLAT" (site rule A3: "at the
-    historic minimum" means nothing when there was never another price,
-    so a flat group is NEVER BLI TANI). chg7 >= +8% -> SHMANG;
-    current <= min(history) x 1.02 -> BLI TANI; else PRIT.
+    Rule (2026-11-23, item 6 — identical to the site rule shipped in
+    parallel in buy_signal.py: verdict_for() + index.html: verdictFor):
+    needs >= 2 entries, else None.
+    - FLAT: the price range over the FULL available history is < 3%
+      ((max-min)/min < 0.03) -> "FLAT" ("Çmim i qëndrueshëm"), NEVER
+      BLI TANI. The window is the full available history (all points in
+      history.json for the group) — the same window the site's flat
+      check uses — NOT just the last 30 days. A flat history means "at
+      the historic minimum" carries no information (e.g. iPhone 17
+      256GB: 53 points, 74.000-74.900, spread 1.2% -> FLAT).
+    - chg7 = change vs the price 7 days ago (or the first entry if fewer
+      than 8 points); chg7 >= +8% -> SHMANG. Checked AFTER flat (the
+      site checks flat first too): with a < 3% range the 7-day change
+      can only reach +8% when TODAY's price jumped.
+    - BLI TANI only when current <= min(last 30 points) AND current <=
+      0.95 * median(last 30 points); else PRIT. Histories shorter than
+      30 points use all available points.
+    - Family cap (site rule, 2026-11-23 item 2): BLI TANI -> PRIT when
+      current >= 1.10 * family_best (cheapest in-stock EU price of the
+      same model+storage family, from a different group); skipped when
+      family_best is None or equals current. Never SHMANG.
     `current` defaults to the last history price; pass the group's
     cheapest VALID price when it is known (spec §2.3).
+    `family_best` = group["family_best_in_stock"] (build.py); None when
+    the field is absent (old data) — the cap is then skipped.
     """
     if not history or len(history) < 2:
         return None
     prices = [p for _d, p in history if p]
     if not prices:
         return None
-    if max(prices) <= min(prices):
+    mn = min(prices)
+    mx = max(prices)
+    if mn and (mx - mn) / mn < 0.03:
         return "FLAT"
     if current is None:
         current = history[-1][1]
@@ -804,9 +830,17 @@ def verdict_for(history, current=None):
     chg7 = ((current - week_ago) / week_ago) if week_ago else 0
     if chg7 >= 0.08:
         return "SHMANG"
-    if current <= min(prices) * 1.02:
-        return "BLI TANI"
-    return "PRIT"
+    last30 = prices[-30:]
+    min30 = min(last30)
+    med30 = statistics.median(last30)
+    if current <= min30 and current <= 0.95 * med30:
+        verdict = "BLI TANI"
+    else:
+        verdict = "PRIT"
+    if (verdict == "BLI TANI" and family_best is not None
+            and family_best != current and current >= 1.10 * family_best):
+        return "PRIT"
+    return verdict
 
 
 def discount_pct(price, old):

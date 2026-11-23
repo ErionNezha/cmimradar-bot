@@ -18,11 +18,18 @@ Rregullat kanonike (çmimi më i lirë me dy nivele stoku, verdikti nga
 historia, kërkimi, formatimi, linket /p/<slug>-<id>) jetojnë në
 radar_logic.py — boti e importon si modul fqinj dhe e përdor kudo.
 Kur build.py / buy_signal.py shkruajnë fushat e reja në products.json
-(group["best"] / ["best_in_stock"] / ["verdict"]), boti i parapëlqen —
-"best" VETËM kur grupi ka edhe "best_in_stock" (shenja që Part A e
-ripërcaktoi best-in si çmimi më i lirë valid; best-i i vjetër pa
-best_in_stock NUK besohet kurrë, D4 2026-11-19); përndryshe i llogarit
-pastër me radar_logic. Të dyja rrugët japin të njëjtën përgjigje.
+(group["best"] / ["best_in_stock"] / ["verdict"]), boti i parapëlqen
+"best" / "best_in_stock" — "best" VETËM kur grupi ka edhe
+"best_in_stock" (shenja që Part A e ripërcaktoi best-in si çmimi më i
+lirë valid; best-i i vjetër pa best_in_stock NUK besohet kurrë, D4
+2026-11-19); përndryshe i llogarit pastër me radar_logic. VERDIKTI
+është përjashtim (2026-11-23, item 6): kur historia është e
+disponueshme, verdikti llogaritet me rregullin e botit
+(radar_logic.verdict_for) — fusha group["verdict"] e skanerit është një
+fotografi e shkruar nga buy_signal.py e skanimit të fundit dhe vjetrohet
+kur rregulli ndryshon; ajo përdoret vetëm si fallback kur historia
+mungon. Të dyja rrugët japin të njëjtën përgjigje sapo skaneri të
+shkruajë rregullin e ri (të njëjtin history.json + family_best).
 
 Alarmet / digest / përmbledhja admin DËRGOHEN VETËM nga cron-i
 (check_remote_alerts.py, pas çdo skanimi). Kopjet e fjetura që ishin
@@ -43,6 +50,7 @@ import json
 import os
 import random
 import re
+import statistics
 import time
 import traceback
 import urllib.parse
@@ -418,11 +426,17 @@ def _canonical_cheapest(g):
 def _verdict_for_group(g, cheapest_price):
     """(label, reason) ose (None, None). Verdikti vjen vetëm nga historia.
 
-    Parapëlqehet group["verdict"] i skanerit (kur grupi s'është i bashkuar);
-    arsyeja llogaritet gjithmonë nga historia, me çmimin më të lirë valid
-    si `current`. Pa histori (ose < 2 pika) → (None, None), përveç kur
-    skaneri ka verdikt (historia mungon lokalisht) — atëherë kthehet
-    verdikti i skanerit me arsye gjenerike.
+    2026-11-23 (item 6): kur historia është e disponueshme (>= 2 pika),
+    verdikti llogaritet me rregullin e botit (radar_logic.verdict_for,
+    me family_best = group["family_best_in_stock"]) — fusha
+    group["verdict"] e skanerit është një fotografi e shkruar nga
+    buy_signal.py e skanimit të fundit dhe vjetrohet kur rregulli
+    ndryshon (p.sh. iPhone 17 ishte BLI TANI me rregullin e vjetër,
+    ndërsa historia e tij e sheshtë 74.000–74.900 thotë FLAT me
+    rregullin e ri). Të dyja rrugët përdorin të njëjtin history.json
+    dhe të njëjtin family_best_in_stock, ndaj sapo skaneri të shkruajë
+    rregullin e ri, përgjigjet përkojnë prapë. Pa histori (ose < 2 pika)
+    kthehet verdikti i skanerit me arsye gjenerike, si më parë.
     """
     key = g.get("key", "")
     hgroups = (DATA.get("history") or {}).get("groups", {}) or {}
@@ -430,20 +444,23 @@ def _verdict_for_group(g, cheapest_price):
     hist = (entry or {}).get("history") or []
     if hist and len(hist) >= 2 and cheapest_price:
         prices = [p for _d, p in hist if p]
-        mn = min(prices) if prices else None
+        last30 = prices[-30:] if prices else []
+        min30 = min(last30) if last30 else None
+        med30 = statistics.median(last30) if last30 else None
         week_ago = hist[-8][1] if len(hist) > 7 else hist[0][1]
         chg7 = ((cheapest_price - week_ago) / week_ago * 100) if week_ago else 0
-        label = None
-        if not g.get("_merged"):
+        label = radar_logic.verdict_for(
+            hist, current=cheapest_price,
+            family_best=g.get("family_best_in_stock"))
+        if label is None and not g.get("_merged"):
             label = radar_logic.scanner_verdict(g)
-        if label is None:
-            label = radar_logic.verdict_for(hist, current=cheapest_price)
         if label == "SHMANG":
             reason = "Çmimi u rrit %s%% kundrejt 7 ditëve më parë." % _fmt_pct(chg7)
         elif label == "BLI TANI":
-            if mn:
-                reason = ("Çmimi sot është te minimumi historik (%s L)."
-                          % fmt_price(mn))
+            if min30 and med30:
+                reason = ("Çmimi sot është te minimumi 30-ditor (%s L) dhe "
+                          "≥5%% nën medianën 30-ditore (%s L)."
+                          % (fmt_price(min30), fmt_price(med30)))
             else:
                 reason = "Çmimi sot është ndër më të ulëtit historik."
         elif label == "FLAT":
@@ -453,9 +470,14 @@ def _verdict_for_group(g, cheapest_price):
             return ("Çmim i qëndrueshëm",
                     "Çmimi nuk ka lëvizur në historinë e regjistruar.")
         elif label == "PRIT":
-            if mn:
-                reason = ("Minimumi historik është %s L — sot %s L."
-                          % (fmt_price(mn), fmt_price(cheapest_price)))
+            if min30 and cheapest_price <= min30:
+                reason = ("Çmimi sot është te minimumi 30-ditor (%s L), "
+                          "por jo ≥5%% nën medianën 30-ditore (%s L) — "
+                          "prandaj PRIT, jo BLI TANI."
+                          % (fmt_price(min30), fmt_price(med30)))
+            elif min30:
+                reason = ("Minimumi 30-ditor është %s L — sot %s L."
+                          % (fmt_price(min30), fmt_price(cheapest_price)))
             else:
                 reason = "Çmimi nuk është te minimumi historik."
         else:

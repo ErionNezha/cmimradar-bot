@@ -6,12 +6,12 @@ Usage: python3 bot-test-fix6.py [products.json path] [radar_logic.py path]
 Defaults: fresh download from cmimradar.netlify.app; ~/workspace/cmimradar-bot/radar_logic.py
 Exit 0 = all pass, 1 = any fail.
 
-Item 6 (2026-11-23) — verdict rule: FLAT when the price range over the
-FULL available history is < 3%; BLI TANI only when current <= min(last 30)
-AND current <= 0.95 * median(last 30); family cap (BLI TANI -> PRIT when
-current >= 1.10 * family_best_in_stock). Verdict assertions below use the
-same history.json the bot loads; lead assertions are unchanged (zero
-regressions allowed on leads/prices).
+Item 6 (2026-11-23) — verdict rule (spec item 3): w30 = last 30 history
+points (max 30); FLAT when (max(w30)-min(w30))/min(w30) < 0.03; BLI TANI
+only when current <= min(w30) AND current <= 0.95 * median(w30); family
+cap (BLI TANI -> PRIT when current >= 1.10 * family_best_in_stock).
+Verdict assertions below use the same history.json the bot loads; lead
+assertions are unchanged (zero regressions allowed on leads/prices).
 """
 import importlib.util, json, os, subprocess, sys
 
@@ -143,13 +143,13 @@ else:
 # (key, expected_verdict, note)
 VERDICT_CASES = [
     ("01236525b960d5ff", "FLAT",
-     "iPhone 17 256GB: 53 pts 74.000-74.900, spread 1.22% < 3% -> FLAT, "
+     "iPhone 17 256GB: w30 74.000-74.900, spread 1.22% < 3% -> FLAT, "
      "never BLI TANI (scanner field still says BLI TANI, old rule)"),
     ("d2b6939034cc8f00", "PRIT",
      "iPhone 17 Pro Max 256GB: 114.990 > min30 110.900 -> PRIT"),
-    ("b2f17ae3ab6640c2", "PRIT",
-     "iPhone 17 Pro 256GB: 96.900 = min30 but 0% under med30 -> PRIT, "
-     "not BLI TANI (old site table said BLI TANI)"),
+    ("b2f17ae3ab6640c2", "FLAT",
+     "iPhone 17 Pro 256GB: w30 spread 0.00% (flat at 96.900 the last 30 "
+     "days; moved earlier in the 53-pt history) -> FLAT per spec item 3"),
     ("426f7d2561bd0ca1", "PRIT",
      "iPhone 18 Pro Max 256GB: 134.900 = min30 but only 2.9% under "
      "med30 138.990 -> PRIT, not BLI TANI (old site table said BLI TANI)"),

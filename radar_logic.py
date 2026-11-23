@@ -40,10 +40,10 @@ Documented approximations / deviations (do not "fix" silently):
   The optional `family_best` is group["family_best_in_stock"]
   (build.py): BLI TANI -> PRIT when current >= 1.10 * family_best
   from a different group (site rule, 2026-11-23 item 2). Rule
-  (2026-11-23, item 6): FLAT when the price range over the FULL
-  available history is < 3%; BLI TANI only when current <= min(last 30)
-  AND current <= 0.95 * median(last 30); chg7 >= +8% -> SHMANG;
-  else PRIT.
+  (2026-11-23, item 6, spec item 3): w30 = last 30 history points
+  (max 30); FLAT when (max(w30)-min(w30))/min(w30) < 0.03; BLI TANI
+  only when current <= min(w30) AND current <= 0.95 * median(w30);
+  chg7 >= +8% -> SHMANG; else PRIT.
 - answer_ai() applies the laptop-spec rule to the PICKS as well as to the
   honest fallback (spec §2.5 says explicitly "applies to the picks AND to
   the honest fallback"; the reference file applies it only to the fallback).
@@ -788,22 +788,20 @@ def verdict_for(history, current=None, family_best=None):
     """Verdict from history only. history = [[date, price], ...].
 
     Rule (2026-11-23, item 6 — identical to the site rule shipped in
-    parallel in buy_signal.py: verdict_for() + index.html: verdictFor):
-    needs >= 2 entries, else None.
-    - FLAT: the price range over the FULL available history is < 3%
-      ((max-min)/min < 0.03) -> "FLAT" ("Çmim i qëndrueshëm"), NEVER
-      BLI TANI. The window is the full available history (all points in
-      history.json for the group) — the same window the site's flat
-      check uses — NOT just the last 30 days. A flat history means "at
-      the historic minimum" carries no information (e.g. iPhone 17
-      256GB: 53 points, 74.000-74.900, spread 1.2% -> FLAT).
+    parallel in buy_signal.py: verdict_for() + index.html: verdictFor).
+    Dritarja është w30 = 30 pikat e fundit të historisë (max 30);
+    histori më të shkurtra përdorin të gjitha pikat e disponueshme.
+    Needs >= 2 entries, else None.
+    - FLAT: the price range over w30 is < 3% ((max(w30)-min(w30)) /
+      min(w30) < 0.03) -> "FLAT" ("Çmim i qëndrueshëm"), NEVER BLI TANI.
+      A flat w30 means "at the historic minimum" carries no information
+      (e.g. iPhone 17 256GB: w30 74.000-74.900, spread 1.2% -> FLAT).
     - chg7 = change vs the price 7 days ago (or the first entry if fewer
       than 8 points); chg7 >= +8% -> SHMANG. Checked AFTER flat (the
-      site checks flat first too): with a < 3% range the 7-day change
-      can only reach +8% when TODAY's price jumped.
-    - BLI TANI only when current <= min(last 30 points) AND current <=
-      0.95 * median(last 30 points); else PRIT. Histories shorter than
-      30 points use all available points.
+      site checks flat first too): with a < 3% w30 range the 7-day
+      change can only reach +8% when TODAY's price jumped.
+    - BLI TANI only when current <= min(w30) AND current <= 0.95 *
+      median(w30); else PRIT.
     - Family cap (site rule, 2026-11-23 item 2): BLI TANI -> PRIT when
       current >= 1.10 * family_best (cheapest in-stock EU price of the
       same model+storage family, from a different group); skipped when
@@ -818,9 +816,16 @@ def verdict_for(history, current=None, family_best=None):
     prices = [p for _d, p in history if p]
     if not prices:
         return None
-    mn = min(prices)
-    mx = max(prices)
-    if mn and (mx - mn) / mn < 0.03:
+    # Dritarja w30 = 30 pikat e fundit (max 30); histori më të shkurtra
+    # përdorin të gjitha pikat e disponueshme. TË GJITHA kontrollet e
+    # rregullit (FLAT, min, median) maten mbi w30 — jo mbi gjithë
+    # historinë (korrigjim 2026-11-23, item 3: FLAT mbi gjithë historinë
+    # e linte jashtë një grupi që ka qenë i qëndrueshëm 30 ditët e fundit
+    # por ka lëvizur më parë).
+    last30 = prices[-30:]
+    mn30 = min(last30)
+    mx30 = max(last30)
+    if mn30 and (mx30 - mn30) / mn30 < 0.03:
         return "FLAT"
     if current is None:
         current = history[-1][1]
@@ -830,10 +835,8 @@ def verdict_for(history, current=None, family_best=None):
     chg7 = ((current - week_ago) / week_ago) if week_ago else 0
     if chg7 >= 0.08:
         return "SHMANG"
-    last30 = prices[-30:]
-    min30 = min(last30)
     med30 = statistics.median(last30)
-    if current <= min30 and current <= 0.95 * med30:
+    if current <= mn30 and current <= 0.95 * med30:
         verdict = "BLI TANI"
     else:
         verdict = "PRIT"
